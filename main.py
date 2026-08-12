@@ -1,1208 +1,1059 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Golike Job Ảo - Single file, chỉ hỗ trợ: Twitter, Threads, LinkedIn, Pinterest, Snapchat
+Dùng golike-gauth 0.1.13, bật sig + captcha tự động.
+"""
+
 import os
 import sys
 import time
 import json
-import uuid
-import queue
-import base64
-import hashlib
-import secrets
 import threading
+import queue
+import argparse
 from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, List
-from urllib.parse import urlencode
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
+from typing import List, Dict, Optional, Any
 
-try:
-    from curl_cffi import requests
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
-    from curl_cffi import requests
+from golike_gauth import GolikeAuth, auto_solve_captcha
+import requests
 
-salt = "glk-gauth-v3-2026q3"
-info = "aes-gcm-key"
-client = "109096667105508"
-version = "26.07.10.2"
-url = "https://gateway.golike.net/api"
-agent = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
-regex = hashlib.re.compile(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$") if hasattr(hashlib, "re") else __import__("re").compile(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$")
-lock = threading.Lock()
-path = "config.json"
-txt = "au.txt"
+# ============================================================================
+# Colors
+# ============================================================================
+class Colors:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+    BOLD_RED = '\033[1;31m'
+    BOLD_GREEN = '\033[1;32m'
+    BOLD_YELLOW = '\033[1;33m'
+    BOLD_BLUE = '\033[1;34m'
+    BOLD_CYAN = '\033[1;36m'
+    BOLD_WHITE = '\033[1;37m'
+    MAGENTA = '\033[35m'
+    BOLD_MAGENTA = '\033[1;35m'
 
-class color:
-    reset = '\033[0m'
-    bold = '\033[1m'
-    red = '\033[31m'
-    green = '\033[32m'
-    yellow = '\033[33m'
-    blue = '\033[34m'
-    cyan = '\033[36m'
-    white = '\033[37m'
-    magenta = '\033[35m'
+print_lock = threading.Lock()
 
-default = {
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+
+# ============================================================================
+# Debug API logger — bọc auth.get / auth.post, in request + response đầy đủ
+# ============================================================================
+def _dump_request(method: str, url: str, params=None, json_body=None, headers=None):
+    safe_print(f"\n{Colors.BOLD_MAGENTA}{'─'*60}")
+    safe_print(f"  ► {method.upper()}  {url}")
+    if params:
+        safe_print(f"  PARAMS : {json.dumps(params, ensure_ascii=False)}")
+    if json_body is not None:
+        safe_print(f"  BODY   : {json.dumps(json_body, separators=(',',':'), ensure_ascii=False)}")
+    if headers:
+        for k in ("Authorization", "g-auth", "g-device-id", "g-username", "g-version", "g-client", "t"):
+            v = headers.get(k)
+            if v:
+                display = (v[:40] + "...") if len(str(v)) > 43 else v
+                safe_print(f"  HDR    {k}: {display}")
+    safe_print(f"{Colors.RESET}", end="")
+
+def _dump_response(resp):
+    try:
+        body = resp.json()
+        text = json.dumps(body, indent=2, ensure_ascii=False)
+    except Exception:
+        text = resp.text[:2000]
+    safe_print(f"{Colors.BOLD_YELLOW}  ◄ HTTP {resp.status_code}")
+    for line in text.splitlines()[:60]:
+        safe_print(f"    {line}")
+    if len(text.splitlines()) > 60:
+        safe_print(f"    ... (truncated)")
+    safe_print(f"{'─'*60}{Colors.RESET}\n")
+
+def debug_get(auth, path: str, params=None):
+    """auth.get wrapper với debug dump."""
+    resp = auth.get(path, params=params)
+    if is_debug_enabled():
+        base = getattr(auth, 'base_url', 'https://gateway.golike.net/api')
+        url = base.rstrip('/') + path
+        hdrs = resp.request.headers if hasattr(resp, 'request') and resp.request else {}
+        _dump_request("GET", url, params=params, headers=dict(hdrs))
+        _dump_response(resp)
+    return resp
+
+def debug_post(auth, path: str, json_body=None):
+    """auth.post wrapper với debug dump."""
+    resp = auth.post(path, json=json_body)
+    if is_debug_enabled():
+        base = getattr(auth, 'base_url', 'https://gateway.golike.net/api')
+        url = base.rstrip('/') + path
+        hdrs = resp.request.headers if hasattr(resp, 'request') and resp.request else {}
+        _dump_request("POST", url, json_body=json_body, headers=dict(hdrs))
+        _dump_response(resp)
+    return resp
+
+def show_banner():
+    safe_print(f"{Colors.BOLD_CYAN}Golike Job Ảo - v2 (chỉ Twitter, Threads, LinkedIn, Pinterest, Snapchat){Colors.RESET}")
+
+def countdown(seconds: int, message: str = "Waiting"):
+    for remaining in range(seconds, -1, -1):
+        with print_lock:
+            sys.stdout.write(f"\r{Colors.BOLD_CYAN}[{message}] {Colors.BOLD_YELLOW}{remaining}s... {Colors.RESET}")
+            sys.stdout.flush()
+        time.sleep(1)
+    with print_lock:
+        print("\r" + " " * 60 + "\r", end="")
+
+def ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{Colors.BOLD_CYAN}{prompt}{suffix}: {Colors.RESET}").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+    return val or default
+
+def ask_choice(prompt: str, options, allow_back: bool = True) -> int:
+    safe_print(f"\n{Colors.BOLD_WHITE}{prompt}{Colors.RESET}")
+    for i, label in enumerate(options, start=1):
+        safe_print(f"  {Colors.BOLD_CYAN}{i}{Colors.RESET}. {label}")
+    if allow_back:
+        safe_print(f"  {Colors.BOLD_CYAN}0{Colors.RESET}. {Colors.YELLOW}← Quay lại{Colors.RESET}")
+    while True:
+        raw = ask("Chọn", "0" if allow_back else "1")
+        try:
+            n = int(raw)
+        except ValueError:
+            safe_print(f"{Colors.RED}Vui lòng nhập số.{Colors.RESET}")
+            continue
+        if allow_back and n == 0:
+            return -1
+        if 1 <= n <= len(options):
+            return n - 1
+        safe_print(f"{Colors.RED}Lựa chọn không hợp lệ.{Colors.RESET}")
+
+def mask(s: str, keep: int = 8) -> str:
+    if not s:
+        return f"{Colors.YELLOW}(rỗng){Colors.RESET}"
+    if len(s) <= keep * 2:
+        return s[:4] + "..." + s[-4:]
+    return s[:keep] + "..." + s[-keep:]
+
+# ============================================================================
+# Config
+# ============================================================================
+FILE_CONFIG = 'config.json'
+DEFAULT_CONFIG = {
     "token": "",
-    "signing_key": "",
-    "user_id": 0,
-    "username": "",
-    "password": "",
-    "device_id": "",
     "webhook_url": "",
+    "debug": False,
     "so_luong_job": 1000,
     "delay_giay": 5,
     "dung_sau_loi": 5,
 }
 
-def say(*args, **kwargs):
-    with lock:
-        try:
-            sys.stdout.reconfigure(encoding='utf-8')
-        except AttributeError:
-            pass
-        print(*args, **kwargs)
+def init_config_if_missing():
+    if not os.path.exists(FILE_CONFIG):
+        with open(FILE_CONFIG, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_CONFIG.copy(), f, indent=4, ensure_ascii=False)
 
-
-def banner():
-    os.system("cls" if os.name == "nt" else "clear")
-    now = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-    data = f"""
-{color.cyan}╔════════════════════════════════════════════════════════════════════════╗
-{color.cyan}║{color.white}                       ⛃  BÉ TẬP CODE TOOL  ⛃                        {color.cyan}║
-{color.cyan}╠════════════════════════════════════════════════════════════════════════╣
-{color.cyan}║ {color.yellow}⛃  TOOL BY       {color.white}: ThanhBinh Tool                                     {color.cyan}║
-{color.cyan}║ {color.yellow}⛃  VERSION       {color.white}: Professional v1.0                    {color.cyan}║
-{color.cyan}║ {color.yellow}⛃  DATE          {color.white}: {now}                             {color.cyan}║
-{color.cyan}╚════════════════════════════════════════════════════════════════════════╝{color.reset}
-"""
-    say(data)
-
-def wait(seconds: int, msg: str = "Waiting"):
-    for remaining in range(seconds, -1, -1):
-        with lock:
-            sys.stdout.write(f"\r{color.cyan}[{msg}] {color.yellow}{remaining}s... {color.reset}")
-            sys.stdout.flush()
-        time.sleep(1)
-    with lock:
-        print("\r" + " " * 60 + "\r", end="")
-
-def ask(prompt: str, defaultval: str = "") -> str:
-    suffix = f" [{defaultval}]" if defaultval else ""
+def load_config():
+    init_config_if_missing()
     try:
-        val = input(f"{color.cyan}{prompt}{suffix}: {color.reset}").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        sys.exit(0)
-    return val or defaultval
-
-def choice(prompt: str, options, allow: bool = True) -> int:
-    say(f"\n{color.white}{prompt}{color.reset}")
-    for i, label in enumerate(options, start=1):
-        say(f"  {color.cyan}{i}{color.reset}. {label}")
-    if allow:
-        say(f"  {color.cyan}0{color.reset}. {color.yellow}← Quay lại{color.reset}")
-    while True:
-        raw = ask("Chọn", "0" if allow else "1")
-        try:
-            n = int(raw)
-        except ValueError:
-            say(f"{color.red}Vui lòng nhập số.{color.reset}")
-            continue
-        if allow and n == 0:
-            return -1
-        if 1 <= n <= len(options):
-            return n - 1
-        say(f"{color.red}Lựa chọn không hợp lệ.{color.reset}")
-
-def mask(s: str, keep: int = 8) -> str:
-    if not s:
-        return f"{color.yellow}(rỗng){color.reset}"
-    if len(s) <= keep * 2:
-        return s[:4] + "..." + s[-4:]
-    return s[:keep] + "..." + s[-keep:]
-
-def init():
-    if not os.path.exists(path):
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(default.copy(), f, indent=4, ensure_ascii=False)
-
-def load():
-    init()
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(FILE_CONFIG, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        legacy = {"auth_token", "t_token"}
-        if legacy & set(data.keys()):
-            data = default.copy()
-            save(data)
-            return data
-        updated = False
-        for k, v in default.items():
+        for k, v in DEFAULT_CONFIG.items():
             if k not in data:
                 data[k] = v
-                updated = True
-        if updated:
-            save(data)
+        # Xóa các key cũ
+        for old in ("signing_key", "user_id", "username", "device_id", "g_version"):
+            data.pop(old, None)
+        save_config(data)
         return data
     except Exception:
-        save(default.copy())
-        return default.copy()
+        save_config(DEFAULT_CONFIG.copy())
+        return DEFAULT_CONFIG.copy()
 
-def save(data: dict):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+def save_config(config: dict):
+    with open(FILE_CONFIG, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
 
-config = load()
+init_config_if_missing()
+CONFIG = load_config()
 
-def put(key: str, val, data: dict = None):
-    cfg = data if data is not None else config
-    cfg[key] = val
-    save(cfg)
-    return cfg
+def set_field(key: str, value):
+    CONFIG[key] = value
+    save_config(CONFIG)
 
-def check(data: dict = None) -> bool:
-    cfg = data if data is not None else config
-    token = (cfg.get("token") or "").strip()
-    sk = (cfg.get("signing_key") or "").strip()
-    try:
-        uid = int(cfg.get("user_id") or 0)
-    except (TypeError, ValueError):
-        uid = 0
-    return bool(token) and bool(sk) and uid > 0
+def get_webhook() -> str:
+    return (CONFIG.get("webhook_url") or "").strip()
 
-def webhook(data: dict = None) -> str:
-    cfg = data if data is not None else config
-    return (cfg.get("webhook_url") or "").strip()
+def is_debug_enabled() -> bool:
+    env = os.environ.get("GOLIKE_DEBUG", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return bool(CONFIG.get("debug", False))
 
-def encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-def decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s.replace("-", "+").replace("_", "/") + pad)
-
-def btoa(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-def sha(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def device() -> str:
-    return str(uuid.uuid4())
-
-def nonce() -> str:
-    return encode(secrets.token_bytes(16))
-
-def parse(raw: str) -> bytes:
-    if not raw:
-        raise ValueError("signing_key rỗng")
-    raw = raw.strip()
-    s = raw
-    hexs = (
-        len(s) == 64
-        and all(c in "0123456789abcdefABCDEF" for c in s)
+# ============================================================================
+# GolikeAuth wrapper
+# ============================================================================
+def create_auth_from_token(token: str) -> GolikeAuth:
+    return GolikeAuth.from_token(
+        token,
+        enable_sig=True,
+        captcha_solver=auto_solve_captcha,
+        captcha_max_attempts=3,
+        fetch_session=True,
     )
-    if hexs:
-        try:
-            res = bytes.fromhex(s)
-            if len(res) == 32:
-                return res
-        except ValueError:
-            pass
+
+def get_auth_from_config() -> Optional[GolikeAuth]:
+    token = (CONFIG.get("token") or "").strip()
+    if not token:
+        return None
     try:
-        res = base64.b64decode(s, validate=False)
-        if len(res) == 32:
-            return res
-    except Exception:
-        pass
-    try:
-        pad = "=" * (-len(s) % 4)
-        res = base64.urlsafe_b64decode(s + pad)
-        if len(res) == 32:
-            return res
-    except Exception:
-        pass
-    raise ValueError("signing_key không decode ra được 32 bytes.")
-
-def derive(raw: str) -> bytes:
-    ikm = parse(raw)
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt.encode("utf-8"),
-        info=info.encode("utf-8"),
-    ).derive(ikm)
-
-def route(p: str, prefix: str = "/api") -> str:
-    p = p.split("?", 1)[0].split("#", 1)[0]
-    val = p.lstrip("/")
-    if prefix and not val.startswith(prefix.strip("/") + "/") and val != prefix.strip("/"):
-        val = f"{prefix.strip('/')}/{val}" if val else prefix
-    return "/" + val
-
-def body(b) -> str:
-    if b is None:
-        return ""
-    if isinstance(b, str):
-        return b
-    if isinstance(b, (bytes, bytearray)):
-        try:
-            return bytes(b).decode("utf-8")
-        except UnicodeDecodeError:
-            return bytes(b).decode("utf-8", errors="replace")
-    return json.dumps(b, separators=(",", ":"), ensure_ascii=False)
-
-def payload(method: str, p: str, b: str, dev: str, uid: int, ts: Optional[int] = None, val: Optional[str] = None) -> dict:
-    t = ts if ts is not None else int(time.time() * 1000)
-    x = val if val is not None else nonce()
-    n = method.upper()
-    k = route(p)
-    q = sha(b)
-    r = sha(f"{t}:{dev}:{q}:{salt}")[:16]
-    return {"t": t, "x": x, "d": dev, "u": uid, "n": n, "k": k, "q": q, "r": r}
-
-def encrypt(method: str, p: str, b, raw: str, dev: str, uid: int) -> str:
-    key = derive(raw)
-    data = body(b)
-    pay = payload(method, p, data, dev, uid)
-    pt = json.dumps(pay, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    iv = secrets.token_bytes(12)
-    ct = AESGCM(key).encrypt(iv, pt, None)
-    return encode(iv + ct)
-
-def decrypt(token: str, raw: str) -> dict:
-    key = derive(raw)
-    data = decode(token)
-    iv, ct = data[:12], data[12:]
-    pt = AESGCM(key).decrypt(iv, ct, None)
-    return json.loads(pt.decode("utf-8"))
-
-def header(ts: Optional[int] = None) -> str:
-    val = ts if ts is not None else int(time.time())
-    once = btoa(str(val).encode("ascii"))
-    twice = btoa(once.encode("ascii"))
-    thrice = btoa(twice.encode("ascii"))
-    return thrice
-
-def login(user: str, pwd: str) -> dict:
-    try:
-        body = {"username": user, "password": pwd}
-        hd = {
-            "content-type": "application/json;charset=utf-8",
-            "accept": "application/json",
-            "user-agent": agent
-        }
-        resp = requests.post(f"{url}/auto/login", json=body, headers=hd, impersonate="chrome")
-        res = resp.json()
-        if res and res.get("success") is True:
-            sec = res.get("security", {})
-            info = res.get("data", {})
-            return {
-                "ok": True,
-                "token": res.get("token"),
-                "key": sec.get("signing_key"),
-                "device": sec.get("device_id"),
-                "id": int(info.get("id") or 0),
-                "name": info.get("username"),
-            }
-        return {"ok": False, "msg": res.get("message") or "Sai tài khoản hoặc mật khẩu"}
+        auth = create_auth_from_token(token)
+        CONFIG["username"] = auth.username
+        CONFIG["user_id"] = auth.user_id
+        save_config(CONFIG)
+        return auth
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        safe_print(f"{Colors.RED}Lỗi tạo auth từ token: {e}{Colors.RESET}")
+        return None
 
-class Auth:
-    def __init__(self, token: str, key: str, uid: int, user: str, dev: str):
-        self.token = token
-        self.key = key
-        self.uid = uid
-        self.user = user
-        self.dev = dev
-        if not self.token:
-            raise ValueError("Token rỗng")
-        if not regex.match(self.token.strip()):
-            raise ValueError("Token không hợp lệ")
-        if not self.key:
-            raise ValueError("Key rỗng")
-        parse(self.key)
-        if not isinstance(self.uid, int) or self.uid <= 0:
-            raise ValueError("Uid không hợp lệ")
-        if not self.user:
-            raise ValueError("User rỗng")
-        if not self.dev:
-            self.dev = device()
-
-    def headers(self, method: str, p: str, b=None) -> dict:
-        data = body(b) if b is not None else ""
-        gauth = encrypt(method, p, data, self.key, self.dev, self.uid)
-        return {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "vi,en-US;q=0.9,en;q=0.8",
-            "authorization": f"Bearer {self.token}",
-            "t": header(),
-            "g-auth": gauth,
-            "g-device-id": self.dev,
-            "g-username": self.user,
-            "g-version": version,
-            "g-client": client,
-            "content-type": "application/json;charset=utf-8",
-            "origin": "https://app.golike.net",
-            "referer": "https://app.golike.net/",
-            "user-agent": agent,
-            "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": '"Android"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-        }
-
-    def refresh(self) -> bool:
-        user = config.get("username") or ""
-        pwd = config.get("password") or ""
-        if not user or not pwd:
-            return False
-        res = login(user, pwd)
-        if res.get("ok"):
-            self.token = res.get("token")
-            self.key = res.get("key")
-            self.uid = res.get("id")
-            self.user = res.get("name")
-            self.dev = res.get("device")
-            self.store()
-            return True
-        return False
-
-    def request(self, method: str, p: str, params=None, body=None) -> dict:
+def prompt_auth() -> GolikeAuth:
+    safe_print(f"\n{Colors.BOLD_WHITE}{'='*60}{Colors.RESET}")
+    safe_print(f"{Colors.BOLD_CYAN}  Nhập JWT token (Bearer){Colors.RESET}")
+    safe_print(f"{Colors.BOLD_WHITE}{'='*60}{Colors.RESET}")
+    while True:
+        token = ask("JWT token", "").strip()
+        if not token:
+            safe_print(f"{Colors.RED}Token không được rỗng.{Colors.RESET}")
+            continue
         try:
-            uri = p
-            if params:
-                uri = f"{p}?{urlencode(params)}"
-            target = f"{url}{uri}"
-            method = method.upper()
-            hd = self.headers(method, p, body)
-            if body is not None:
-                data = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-                resp = requests.request(method, target, headers=hd, data=data.encode("utf-8"), impersonate="chrome")
-            else:
-                resp = requests.request(method, target, headers=hd, impersonate="chrome")
-            res = resp.json()
-            code = res.get("status") or res.get("code")
-            msg = str(res.get("message") or res.get("error") or "")
-            expired = (
-                resp.status_code in (401, 403) or
-                code in (401, 403) or
-                "phien ban" in msg.lower() or
-                "phiên bản" in msg.lower() or
-                "chữ ký" in msg.lower() or
-                "signing" in msg.lower()
-            )
-            if expired:
-                say(f"{color.yellow}  Phát hiện token/key hết hạn hoặc lỗi chữ ký! Đang tự động đăng nhập lại...{color.reset}")
-                if self.refresh():
-                    say(f"{color.green}  Đăng nhập lại thành công! Thử lại tác vụ...{color.reset}")
-                    hd = self.headers(method, p, body)
-                    if body is not None:
-                        resp = requests.request(method, target, headers=hd, data=data.encode("utf-8"), impersonate="chrome")
-                    else:
-                        resp = requests.request(method, target, headers=hd, impersonate="chrome")
-                    res = resp.json()
-                else:
-                    say(f"{color.red}  Đăng nhập lại thất bại!{color.reset}")
-            return res
+            auth = create_auth_from_token(token)
+            break
         except Exception as e:
-            say(f"{method.upper()} {p} error: {e}")
+            safe_print(f"{Colors.RED}Lỗi: {e}. Thử lại.{Colors.RESET}")
+    CONFIG["token"] = token
+    CONFIG["username"] = auth.username
+    CONFIG["user_id"] = auth.user_id
+    save_config(CONFIG)
+    safe_print(f"{Colors.GREEN}✓ Đã tạo auth thành công cho user {auth.username} (ID: {auth.user_id}){Colors.RESET}")
+    return auth
+
+# ============================================================================
+# Base Provider
+# ============================================================================
+class BaseProviderBot:
+    platform: str = ""
+
+    def __init__(self, auth: GolikeAuth, platform: str = ""):
+        if platform:
+            self.platform = platform
+        if not self.platform:
+            raise ValueError("Subclass must set platform")
+        self.auth = auth
+
+    def get_accounts(self) -> Optional[Dict]:
+        try:
+            resp = debug_get(self.auth, f"/{self.platform}-account")
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
             return None
 
-    def get(self, p: str, params=None) -> dict:
-        return self.request("GET", p, params=params)
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
+        raise NotImplementedError
 
-    def post(self, p: str, body: dict = None) -> dict:
-        return self.request("POST", p, body=body or {})
+    def skip_job(self, **kwargs):
+        raise NotImplementedError
 
-    def verify(self) -> dict:
-        try:
-            data = json.dumps({"ping": 1}, separators=(",", ":"))
-            hd = self.headers("POST", "/security/echo", data)
-            last = None
-            res = None
-            for imp in ("chrome120", "chrome110", "chrome"):
-                try:
-                    resp = requests.post(f"{url}/security/echo", headers=hd, data=data.encode("utf-8"), impersonate=imp, timeout=30)
-                    res = resp.json()
-                    break
-                except Exception as e:
-                    last = e
-            if res is None:
-                return {"ok": False, "errors": [str(last)]}
-            code = res.get("code") or res.get("status")
-            msg = str(res.get("message") or res.get("error") or "")
-            if code == 429 or "429" in msg or "qua nhanh" in msg.lower():
-                return {"ok": False, "errors": ["rate_limit_429"], "message": "Rate limit"}
-            g = (res.get("data") or {}).get("gauth") if isinstance(res.get("data"), dict) else {}
-            g = g or {}
-            errs = list(g.get("errors") or [])
-            decoded = g.get("decoded")
-            fail = any("decrypt" in str(e).lower() for e in errs)
-            if decoded is not None and not fail:
-                return {"ok": True, "errors": errs, "decoded": decoded}
-            if fail or (g.get("header_present") and decoded is None and errs):
-                return {"ok": False, "errors": errs or ["decrypt_fail"]}
-            return {"ok": False, "errors": errs or ["no_gauth_in_response"]}
-        except Exception as e:
-            return {"ok": False, "errors": [str(e)]}
-
-    def put(self, p: str, body: dict = None) -> dict:
-        return self.request("PUT", p, body=body or {})
-
-    def patch(self, p: str, body: dict = None) -> dict:
-        return self.request("PATCH", p, body=body or {})
-
-    def delete(self, p: str) -> dict:
-        return self.request("DELETE", p)
-
-    def dump(self) -> dict:
-        return {"token": self.token, "signing_key": self.key, "user_id": self.uid, "username": self.user, "device_id": self.dev}
-
-    def store(self) -> None:
-        for k, v in self.dump().items():
-            put(k, v)
-
-class Bot:
-    def __init__(self, auth: Auth, platform: str):
-        self.auth = auth
-        self.platform = platform
-
-    def accounts(self) -> Optional[Dict[str, Any]]:
-        return self.auth.get(f"/{self.platform}-account")
-
-    def job(self, acc: str) -> Optional[Dict[str, Any]]:
-        return self.auth.get(f"/advertising/publishers/{self.platform}/jobs", params={"account_id": acc, "data": "null"})
-
-    def done(self, ads: str, acc: str) -> Optional[Dict[str, Any]]:
-        pay = {"ads_id": ads, "account_id": acc, "async": True, "data": None}
-        return self.auth.post(f"/advertising/publishers/{self.platform}/complete-jobs", body=pay)
-
-    def skip(self, ads: str, acc: str, obj: str):
-        pay = {"ads_id": ads, "account_id": acc, "object_id": obj}
-        try:
-            self.auth.post(f"/advertising/publishers/{self.platform}/skip-jobs", body=pay)
-        except Exception:
-            pass
-
-    def name(self, acc: Dict[str, Any], idx: int) -> str:
+    def account_display_name(self, acc: Dict, idx: int) -> str:
         return acc.get('name') or acc.get('username') or acc.get('screen_name') or f"Account {idx}"
 
-    def id(self, acc: Dict[str, Any]) -> str:
+    def account_id(self, acc: Dict) -> str:
         return str(acc.get('id', 'N/A'))
 
-platforms = ["twitter", "linkedin", "threads", "pinterest", "snapchat"]
+# ============================================================================
+# Các lớp provider cụ thể (chỉ 5 platform)
+# ============================================================================
+class TwitterBot(BaseProviderBot):
+    platform = "twitter"
 
-class Runner:
-    def __init__(self, auth: Auth):
-        self.auth = auth
-        self.active = True
-        self.stats = {
-            'username': auth.user,
-            'user_id': auth.uid,
-            'coin': 0,
-            'total_earned': 0,
-            'jobs_done': 0,
-        }
-        self.max = config['dung_sau_loi']
-        self.delay = config['delay_giay']
-        self.target = config['so_luong_job']
-
-    def profile(self) -> bool:
+    def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = self.auth.get("/users/me")
-            if resp and resp.get('status') == 200:
-                data = resp['data']
-                self.stats['username'] = data.get('username', data.get('name', self.auth.user))
-                self.stats['coin'] = data.get('coin', 0)
-                say(f"\n{color.green}{'='*60}{color.reset}")
-                say(f"  Username : {color.white}{self.stats['username']}{color.reset}")
-                say(f"  User ID  : {color.white}{self.auth.uid}{color.reset}")
-                say(f"  Device   : {color.white}{self.auth.dev}{color.reset}")
-                say(f"  Coin     : {color.yellow}{self.stats['coin']}{color.reset}")
-                say(f"{color.green}{'='*60}{color.reset}\n")
-                say(f"{color.cyan}  Dang kiem tra signing_key (g-auth)...{color.reset}")
-                v = self.auth.verify()
-                if not v.get("ok"):
-                    say(f"{color.red}  signing_key SAI / het han (server decrypt_fail){color.reset}")
-                    return False
-                say(f"{color.green}  signing_key OK (server decrypt duoc g-auth){color.reset}\n")
-                return True
-            say(f"{color.red}Token không hợp lệ!{color.reset}")
-            return False
-        except Exception as e:
-            say(f"{color.red}Lỗi khi lấy profile: {e}{color.reset}")
-            return False
+            resp = debug_get(
+                self.auth,
+                "/advertising/publishers/twitter/jobs",
+                params={"account_id": account_id}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
 
-    def coin(self):
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
-            resp = self.auth.get("/users/me")
-            if resp and resp.get('status') == 200:
-                self.stats['coin'] = resp['data'].get('coin', 0)
+            job_type = (job_data or {}).get('type', '')
+            if job_type == 'comment':
+                comment_run = (job_data or {}).get('comment_run') or {}
+                comment_id  = comment_run.get('id')       # top-level field
+                message     = comment_run.get('message') or ''
+                body = {
+                    "ads_id":      ads_id,
+                    "account_id":  account_id,
+                    "async":       True,
+                    "comment_id":  comment_id,   # required — id từ comment_run
+                    "message":     message,       # required — text comment
+                }
+            else:
+                body = {
+                    "ads_id":     ads_id,
+                    "account_id": account_id,
+                    "async":      True,
+                    "data":       None,
+                }
+            resp = debug_post(
+                self.auth,
+                "/advertising/publishers/twitter/complete-jobs",
+                json_body=body
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def skip_job(self, ads_id: int, object_id: str, account_id: int):
+        try:
+            debug_post(
+                self.auth,
+                "/advertising/publishers/twitter/skip-jobs",
+                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
+            )
         except Exception:
             pass
 
-    def list(self, plat: Optional[str] = None):
-        targets = [plat] if plat else platforms
-        for name in targets:
-            bot = Bot(self.auth, name)
-            resp = bot.accounts()
-            say(f"\n{color.cyan}── {name.upper()} ──{color.reset}")
-            if not resp or resp.get('status') != 200:
-                continue
-            accounts = resp.get('data', []) or []
-            if not accounts:
-                say(f"{color.yellow}  (rỗng){color.reset}")
-                continue
-            for i, acc in enumerate(accounts):
-                accname = bot.name(acc, i)
-                accid = bot.id(acc)
-                say(f"  [{i}] {accname}  {color.cyan}(ID: {accid}){color.reset}")
+class ThreadsBot(BaseProviderBot):
+    platform = "threads"
 
-    def run(self, name: str) -> int:
-        bot = Bot(self.auth, name)
-        resp = bot.accounts()
-        if not resp or resp.get('status') != 200:
-            say(f"{color.red}Không thể lấy danh sách tài khoản {name}!{color.reset}")
-            return 0
-        accounts = resp.get('data', []) or []
-        if not accounts:
-            say(f"{color.red}Không có tài khoản {name} nào!{color.reset}")
-            return 0
-        say(f"\n{color.green}{name.upper()}: Tìm thấy {len(accounts)} tài khoản{color.reset}")
-        for i, acc in enumerate(accounts):
-            say(f"  [{i}] {bot.name(acc, i)} (ID: {bot.id(acc)})")
-        say(f"\n{color.green}Bắt đầu chạy {self.target} jobs trên {name}...{color.reset}")
-        say(f"{color.cyan}{'='*60}{color.reset}")
-
-        errors = {bot.id(acc): 0 for acc in accounts}
-        fails = 0
-        idx = 0
-        done = 0
-        earned = 0
-
-        for i in range(self.target):
-            if not self.active:
-                break
-            if fails >= self.max:
-                break
-            attempts = 0
-            while attempts < len(accounts):
-                current = accounts[idx]
-                accid = bot.id(current)
-                if errors.get(accid, 0) < 3:
-                    break
-                idx = (idx + 1) % len(accounts)
-                attempts += 1
-            else:
-                break
-            current = accounts[idx]
-            accid = bot.id(current)
-            accname = bot.name(current, idx)
-            jobresp = bot.job(accid)
-            if not jobresp or jobresp.get('status') != 200:
-                errors[accid] = errors.get(accid, 0) + 1
-                fails += 1
-                idx = (idx + 1) % len(accounts)
-                wait(2, "Switching")
-                continue
-            jobdata = jobresp['data']
-            jobtype = jobdata.get('type', 'unknown')
-            link = jobdata.get('link', '')
-            obj = jobdata.get('object_id', '')
-            ads = jobdata.get('id', '')
-            say(f"{color.cyan}[{i+1}/{self.target}] [{accname}] {jobtype.upper()} | {link[:35]}...{color.reset}")
-            wait(10, "Processing")
-            success = False
-            for attempt in range(3):
-                complete = bot.done(ads, accid)
-                if complete and (complete.get('success') or complete.get('status') == 200):
-                    success = True
-                    done += 1
-                    price = complete.get('data', {}).get('prices', 0)
-                    earned += price
-                    self.stats['total_earned'] += price
-                    self.stats['jobs_done'] += 1
-                    errors[accid] = 0
-                    fails = 0
-                    now = datetime.now().strftime("%H:%M:%S")
-                    say(
-                        f"{color.red}| {color.cyan}{self.stats['jobs_done']}{color.red} | "
-                        f"{color.yellow}{now}{color.red} | "
-                        f"{color.green}SUCCESS{color.red} | "
-                        f"{color.blue}{name.upper()}:{jobtype}{color.red} | "
-                        f"{color.green}+{price}{color.red} | "
-                        f"{color.yellow}{self.stats['total_earned']} VND{color.reset}"
-                    )
-                    break
-                else:
-                    if attempt < 2:
-                        wait(3, "Retry")
-            if not success:
-                errors[accid] = errors.get(accid, 0) + 1
-                fails += 1
-                bot.skip(ads, accid, obj)
-            idx = (idx + 1) % len(accounts)
-            if self.delay > 10:
-                wait(self.delay - 10, "Delay")
-            elif self.delay > 0:
-                time.sleep(self.delay)
-        return done
-
-    def scan(self) -> List[str]:
-        active = []
-        for name in platforms:
-            bot = Bot(self.auth, name)
-            resp = bot.accounts()
-            if resp and resp.get('status') == 200:
-                accounts = resp.get('data', []) or []
-                if accounts:
-                    active.append(name)
-        return active
-
-    def start(self, plat: Optional[str] = None):
-        if not self.profile():
-            return
-        say(f"{color.cyan}  Đang kiểm tra liên kết các mạng xã hội...{color.reset}")
-        active = [plat] if plat else self.scan()
-        if not active:
-            say(f"{color.red}Không tìm thấy tài khoản mạng xã hội nào được liên kết!{color.reset}")
-            return
-        say(f"{color.green}Tìm thấy các platform hoạt động: {', '.join([p.upper() for p in active])}{color.reset}")
+    def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            while self.active:
-                for name in active:
-                    if not self.active:
-                        break
-                    say(f"\n{color.magenta}>>> Chuyển sang {name.upper()} <<<{color.reset}")
-                    self.run(name)
-                    self.coin()
-                    say(f"{color.cyan}  ↳ Coin hiện tại: {self.stats['coin']} | Tổng kiếm: {self.stats['total_earned']} VND{color.reset}")
-                    if self.active:
-                        time.sleep(5)
-        except KeyboardInterrupt:
+            resp = debug_get(
+                self.auth,
+                "/advertising/publishers/threads/jobs",
+                params={"account_id": account_id}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
+        try:
+            job_type = (job_data or {}).get('type', '')
+            if job_type == 'comment':
+                message = (job_data.get('comment_run') or {}).get('message') or ''
+                data_field = {"message": message} if message else None
+            else:
+                data_field = None
+            resp = debug_post(
+                self.auth,
+                "/advertising/publishers/threads/complete-jobs",
+                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def skip_job(self, ads_id: int, object_id: str, account_id: int):
+        try:
+            debug_post(
+                self.auth,
+                "/advertising/publishers/threads/skip-jobs",
+                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
+            )
+        except Exception:
             pass
-        finally:
-            say(f"{color.green}Tổng kết: {self.stats['jobs_done']} jobs | {self.stats['total_earned']} VND{color.reset}")
 
-    def stop(self):
-        self.active = False
+class LinkedInBot(BaseProviderBot):
+    platform = "linkedin"
 
-class Worker(threading.Thread):
-    def __init__(self, auth: Auth, wid: int, stats: queue.Queue):
-        super().__init__(daemon=True)
+    def get_job(self, account_id: str) -> Optional[Dict]:
+        try:
+            resp = debug_get(
+                self.auth,
+                "/advertising/publishers/linkedin/jobs",
+                params={"account_id": account_id}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
+        try:
+            job_type = (job_data or {}).get('type', '')
+            if job_type == 'comment':
+                message = (job_data.get('comment_run') or {}).get('message') or ''
+                data_field = {"message": message} if message else None
+            else:
+                data_field = None
+            resp = debug_post(
+                self.auth,
+                "/advertising/publishers/linkedin/complete-jobs",
+                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def skip_job(self, ads_id: int, object_id: str, account_id: int):
+        try:
+            debug_post(
+                self.auth,
+                "/advertising/publishers/linkedin/skip-jobs",
+                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
+            )
+        except Exception:
+            pass
+
+class PinterestBot(BaseProviderBot):
+    platform = "pinterest"
+
+    def get_job(self, account_id: str) -> Optional[Dict]:
+        try:
+            resp = debug_get(
+                self.auth,
+                "/advertising/publishers/pinterest/jobs",
+                params={"account_id": account_id}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
+        try:
+            job_type = (job_data or {}).get('type', '')
+            if job_type == 'comment':
+                message = (job_data.get('comment_run') or {}).get('message') or ''
+                data_field = {"message": message} if message else None
+            else:
+                data_field = None
+            resp = debug_post(
+                self.auth,
+                "/advertising/publishers/pinterest/complete-jobs",
+                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def skip_job(self, ads_id: int, object_id: str, account_id: int):
+        try:
+            debug_post(
+                self.auth,
+                "/advertising/publishers/pinterest/skip-jobs",
+                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
+            )
+        except Exception:
+            pass
+
+class SnapchatBot(BaseProviderBot):
+    platform = "snapchat"
+
+    def get_job(self, account_id: str) -> Optional[Dict]:
+        try:
+            resp = debug_get(
+                self.auth,
+                "/advertising/publishers/snapchat/jobs",
+                params={"account_id": account_id}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
+        try:
+            job_type = (job_data or {}).get('type', '')
+            if job_type == 'comment':
+                message = (job_data.get('comment_run') or {}).get('message') or ''
+                data_field = {"message": message} if message else None
+            else:
+                data_field = None
+            resp = debug_post(
+                self.auth,
+                "/advertising/publishers/snapchat/complete-jobs",
+                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def skip_job(self, ads_id: int, object_id: str, account_id: int):
+        try:
+            debug_post(
+                self.auth,
+                "/advertising/publishers/snapchat/skip-jobs",
+                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
+            )
+        except Exception:
+            pass
+
+# Danh sách platform được hỗ trợ
+ALL_PROVIDERS = [
+    ("Twitter", TwitterBot),
+    ("Threads", ThreadsBot),
+    ("LinkedIn", LinkedInBot),
+    ("Pinterest", PinterestBot),
+    ("Snapchat", SnapchatBot),
+]
+
+def get_bot(platform_name: str, auth: GolikeAuth) -> BaseProviderBot:
+    for name, cls in ALL_PROVIDERS:
+        if name.lower() == platform_name.lower():
+            return cls(auth)
+    raise ValueError(f"Unknown platform: {platform_name}")
+
+# ============================================================================
+# Single Account Runner
+# ============================================================================
+class SingleAccountRunner:
+    def __init__(self, auth: GolikeAuth):
         self.auth = auth
-        self.wid = wid
-        self.stats = stats
-        self.active = True
-        self.info = {
-            'auth': auth.user or auth.token[:15] + '...',
-            'username': auth.user or 'Unknown',
-            'user_id': auth.uid,
+        self.running = True
+        self.stats = {
+            'username': auth.username,
+            'user_id': auth.user_id,
             'coin': 0,
-            'status': 'initializing',
             'total_earned': 0,
             'jobs_done': 0,
-            'last_update': datetime.now(),
         }
-        self.max = config['dung_sau_loi']
-        self.delay = config['delay_giay']
-        self.target = config['so_luong_job']
+        self.max_errors = CONFIG['dung_sau_loi']
+        self.delay_sec = CONFIG['delay_giay']
+        self.jobs_target = CONFIG['so_luong_job']
 
-    def update(self) -> bool:
+    def show_profile(self) -> bool:
         try:
-            resp = self.auth.get("/users/me")
-            if resp and resp.get('status') == 200:
-                data = resp['data']
-                self.info['username'] = data.get('username', data.get('name', self.auth.user))
-                self.info['coin'] = data.get('coin', 0)
-                self.info['status'] = 'active'
+            resp = debug_get(self.auth, "/users/me")
+            if resp.status_code == 200:
+                data = resp.json().get('data', {})
+                self.stats['username'] = data.get('username', self.auth.username)
+                self.stats['coin'] = data.get('coin', 0)
+                safe_print(f"\n{Colors.BOLD_GREEN}{'='*60}{Colors.RESET}")
+                safe_print(f"{Colors.BOLD_CYAN}  Username : {Colors.BOLD_WHITE}{self.stats['username']}{Colors.RESET}")
+                safe_print(f"{Colors.BOLD_CYAN}  User ID  : {Colors.BOLD_WHITE}{self.auth.user_id}{Colors.RESET}")
+                safe_print(f"{Colors.BOLD_CYAN}  Device   : {Colors.BOLD_WHITE}{self.auth.device_id}{Colors.RESET}")
+                safe_print(f"{Colors.BOLD_CYAN}  Coin     : {Colors.BOLD_YELLOW}{self.stats['coin']}{Colors.RESET}")
+                safe_print(f"{Colors.BOLD_GREEN}{'='*60}{Colors.RESET}\n")
                 return True
-            self.info['status'] = 'invalid_token'
+            safe_print(f"{Colors.RED}Token không hợp lệ!{Colors.RESET}")
             return False
         except Exception as e:
-            self.info['status'] = f'error: {str(e)[:20]}'
+            safe_print(f"{Colors.RED}Lỗi lấy profile: {e}{Colors.RESET}")
             return False
 
-    def run_platform(self, name: str):
-        bot = Bot(self.auth, name)
-        resp = bot.accounts()
-        if not resp or resp.get('status') != 200:
+    def list_accounts(self, platform_name: Optional[str] = None):
+        targets = [(platform_name, get_bot(platform_name, self.auth))] if platform_name else [(name, get_bot(name, self.auth)) for name, _ in ALL_PROVIDERS]
+        for name, bot in targets:
+            safe_print(f"\n{Colors.BOLD_CYAN}── {name} ──{Colors.RESET}")
+            accs = bot.get_accounts()
+            if not accs or accs.get('status') != 200:
+                safe_print(f"{Colors.RED}  Không lấy được: {accs.get('message', 'no response') if accs else 'no response'}{Colors.RESET}")
+                continue
+            accounts = accs.get('data', [])
+            if not accounts:
+                safe_print(f"{Colors.YELLOW}  (rỗng){Colors.RESET}")
+                continue
+            for i, acc in enumerate(accounts):
+                safe_print(f"  [{i}] {bot.account_display_name(acc, i)}  {Colors.CYAN}(ID: {bot.account_id(acc)}){Colors.RESET}")
+
+    def run_platform(self, platform_name: str) -> int:
+        bot = get_bot(platform_name, self.auth)
+        accs = bot.get_accounts()
+        if not accs or accs.get('status') != 200:
+            safe_print(f"{Colors.RED}Không lấy được danh sách tài khoản {platform_name}!{Colors.RESET}")
+            return 0
+        accounts = accs.get('data', [])
+        if not accounts:
+            safe_print(f"{Colors.RED}Không có tài khoản {platform_name} nào!{Colors.RESET}")
+            return 0
+
+        safe_print(f"\n{Colors.GREEN}{platform_name}: {len(accounts)} tài khoản{Colors.RESET}")
+        for i, acc in enumerate(accounts):
+            safe_print(f"  [{i}] {bot.account_display_name(acc, i)} (ID: {bot.account_id(acc)})")
+
+        account_errors = {bot.account_id(acc): 0 for acc in accounts}
+        consecutive_errors = 0
+        acc_index = 0
+        jobs_done = 0
+        total_earned = 0
+
+        for i in range(self.jobs_target):
+            if not self.running or consecutive_errors >= self.max_errors:
+                break
+
+            attempts = 0
+            while attempts < len(accounts):
+                cur = accounts[acc_index]
+                acc_id = bot.account_id(cur)
+                if account_errors.get(acc_id, 0) < 3:
+                    break
+                acc_index = (acc_index + 1) % len(accounts)
+                attempts += 1
+            else:
+                safe_print(f"{Colors.RED}Tất cả tài khoản lỗi >3 lần, dừng.{Colors.RESET}")
+                break
+
+            cur_acc = accounts[acc_index]
+            acc_id = bot.account_id(cur_acc)
+            acc_name = bot.account_display_name(cur_acc, acc_index)
+
+            # Gọi get_job với account_id
+            job_json = bot.get_job(account_id=acc_id)
+            job_data = job_json.get('data') if job_json and job_json.get('status') == 200 else None
+
+            if not job_data:
+                msg = job_json.get('message', 'Unknown') if job_json else 'No response'
+                safe_print(f"{Colors.RED}[{i+1}/{self.jobs_target}] [{acc_name}] No job: {msg}. Switching...{Colors.RESET}")
+                account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
+                consecutive_errors += 1
+                acc_index = (acc_index + 1) % len(accounts)
+                countdown(2, "Switching")
+                continue
+
+            job_type = job_data.get('type', 'unknown')
+            link = job_data.get('link', '')
+            object_id = job_data.get('object_id', '')
+            ads_id = job_data.get('id', '')
+
+            safe_print(f"{Colors.CYAN}[{i+1}/{self.jobs_target}] [{acc_name}] {job_type.upper()} | {link[:35]}...{Colors.RESET}")
+            countdown(10, "Processing")
+
+            success = False
+            for attempt in range(3):
+                try:
+                    complete_json = bot.complete_job(ads_id=ads_id, account_id=int(acc_id), job_data=job_data)
+                    if complete_json and (complete_json.get('success') or complete_json.get('status') == 200):
+                        success = True
+                        earned = complete_json.get('data', {}).get('prices', 0)
+                        total_earned += earned
+                        self.stats['total_earned'] += earned
+                        self.stats['jobs_done'] += 1
+                        account_errors[acc_id] = 0
+                        consecutive_errors = 0
+                        safe_print(f"{Colors.BOLD_GREEN}+{earned} VND | Tổng: {self.stats['total_earned']}{Colors.RESET}")
+                        break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    safe_print(f"{Colors.YELLOW}Thử lại lần {attempt+2}/3...{Colors.RESET}")
+                    countdown(3, "Retry")
+
+            if not success:
+                safe_print(f"{Colors.RED}Failed sau 3 lần! Switching...{Colors.RESET}")
+                account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
+                consecutive_errors += 1
+                try:
+                    bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
+                except Exception:
+                    pass
+
+            acc_index = (acc_index + 1) % len(accounts)
+            if self.delay_sec > 10:
+                countdown(self.delay_sec - 10, "Delay")
+            elif self.delay_sec > 0:
+                time.sleep(self.delay_sec)
+
+        safe_print(f"{Colors.BOLD_GREEN}{platform_name} hoàn thành: {jobs_done} jobs | +{total_earned} VND{Colors.RESET}")
+        return jobs_done
+
+    def run(self, only_platform: Optional[str] = None):
+        if not self.show_profile():
             return
-        accounts = resp.get('data', []) or []
+        while self.running:
+            for platform_name, _ in ALL_PROVIDERS:
+                if not self.running: break
+                if only_platform and platform_name.lower() != only_platform.lower(): continue
+                safe_print(f"\n{Colors.BOLD_MAGENTA}>>> {platform_name} <<<{Colors.RESET}")
+                self.run_platform(platform_name)
+                if only_platform:
+                    return
+                if self.running:
+                    time.sleep(5)
+
+# ============================================================================
+# Multi-worker (dùng nhiều token từ au.txt)
+# ============================================================================
+FILE_AUTH = 'au.txt'
+
+class WorkerThread(threading.Thread):
+    def __init__(self, auth: GolikeAuth, worker_id: int, stats_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.auth = auth
+        self.worker_id = worker_id
+        self.stats_queue = stats_queue
+        self.running = True
+        self.stats = {
+            'username': auth.username,
+            'user_id': auth.user_id,
+            'coin': 0,
+            'status': 'active',
+            'total_earned': 0,
+            'jobs_done': 0,
+        }
+        self.max_errors = CONFIG['dung_sau_loi']
+        self.delay_sec = CONFIG['delay_giay']
+        self.jobs_target = CONFIG['so_luong_job']
+
+    def update_user_info(self):
+        try:
+            resp = debug_get(self.auth, "/users/me")
+            if resp.status_code == 200:
+                data = resp.json().get('data', {})
+                self.stats['username'] = data.get('username', self.auth.username)
+                self.stats['coin'] = data.get('coin', 0)
+                self.stats['status'] = 'active'
+                return True
+            self.stats['status'] = 'invalid_token'
+            return False
+        except Exception:
+            self.stats['status'] = 'error'
+            return False
+
+    def run_platform(self, platform_name: str, bot_class):
+        bot = bot_class(self.auth)
+        accs = bot.get_accounts()
+        if not accs or accs.get('status') != 200:
+            return
+        accounts = accs.get('data', [])
         if not accounts:
             return
-        errors = {bot.id(acc): 0 for acc in accounts}
-        fails = 0
-        idx = 0
-        for i in range(self.target):
-            if not self.active:
-                break
-            if fails >= self.max:
+        account_errors = {bot.account_id(acc): 0 for acc in accounts}
+        consecutive_errors = 0
+        acc_index = 0
+        jobs_done = 0
+        total_earned = 0
+
+        for i in range(self.jobs_target):
+            if not self.running or consecutive_errors >= self.max_errors:
                 break
             attempts = 0
             while attempts < len(accounts):
-                current = accounts[idx]
-                accid = bot.id(current)
-                if errors.get(accid, 0) < 3:
+                cur = accounts[acc_index]
+                acc_id = bot.account_id(cur)
+                if account_errors.get(acc_id, 0) < 3:
                     break
-                idx = (idx + 1) % len(accounts)
+                acc_index = (acc_index + 1) % len(accounts)
                 attempts += 1
             else:
                 break
-            current = accounts[idx]
-            accid = bot.id(current)
-            accname = bot.name(current, idx)
-            jobresp = bot.job(accid)
-            if not jobresp or jobresp.get('status') != 200:
-                errors[accid] = errors.get(accid, 0) + 1
-                fails += 1
-                idx = (idx + 1) % len(accounts)
-                wait(2, "Switching")
+            cur_acc = accounts[acc_index]
+            acc_id = bot.account_id(cur_acc)
+            acc_name = bot.account_display_name(cur_acc, acc_index)
+
+            job_json = bot.get_job(account_id=acc_id)
+            job_data = job_json.get('data') if job_json and job_json.get('status') == 200 else None
+
+            if not job_data:
+                account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
+                consecutive_errors += 1
+                acc_index = (acc_index + 1) % len(accounts)
+                countdown(2, "Switching")
                 continue
-            jobdata = jobresp['data']
-            jobtype = jobdata.get('type', 'unknown')
-            link = jobdata.get('link', '')
-            obj = jobdata.get('object_id', '')
-            ads = jobdata.get('id', '')
-            say(f"[Worker {self.wid}] [{i+1}/{self.target}] [{accname}] {jobtype.upper()} | {link[:35]}...{color.reset}")
-            wait(10, "Processing")
+
+            job_type = job_data.get('type', 'unknown')
+            link = job_data.get('link', '')
+            object_id = job_data.get('object_id', '')
+            ads_id = job_data.get('id', '')
+            safe_print(f"{Colors.CYAN}[W{self.worker_id}] {job_type.upper()} | {link[:30]}...{Colors.RESET}")
+            countdown(10, "Processing")
+
             success = False
             for attempt in range(3):
-                complete = bot.done(ads, accid)
-                if complete and (complete.get('success') or complete.get('status') == 200):
-                    success = True
-                    price = complete.get('data', {}).get('prices', 0)
-                    self.info['total_earned'] += price
-                    self.info['jobs_done'] += 1
-                    errors[accid] = 0
-                    fails = 0
-                    now = datetime.now().strftime("%H:%M:%S")
-                    say(
-                        f"{color.red}| {color.cyan}{self.info['jobs_done']}{color.red} | "
-                        f"{color.yellow}{now}{color.red} | "
-                        f"{color.green}SUCCESS{color.red} | "
-                        f"{color.blue}{name.upper()}:{jobtype}{color.red} | "
-                        f"{color.green}+{price}{color.red} | "
-                        f"{color.yellow}{self.info['total_earned']} VND{color.reset}"
-                    )
-                    break
-                else:
-                    if attempt < 2:
-                        wait(3, "Retry")
+                try:
+                    complete_json = bot.complete_job(ads_id=ads_id, account_id=int(acc_id), job_data=job_data)
+                    if complete_json and (complete_json.get('success') or complete_json.get('status') == 200):
+                        success = True
+                        earned = complete_json.get('data', {}).get('prices', 0)
+                        total_earned += earned
+                        self.stats['total_earned'] += earned
+                        self.stats['jobs_done'] += 1
+                        account_errors[acc_id] = 0
+                        consecutive_errors = 0
+                        break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    countdown(3, "Retry")
             if not success:
-                errors[accid] = errors.get(accid, 0) + 1
-                fails += 1
-                bot.skip(ads, accid, obj)
-            idx = (idx + 1) % len(accounts)
-            if self.delay > 10:
-                wait(self.delay - 10, "Delay")
-            elif self.delay > 0:
-                time.sleep(self.delay)
+                account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
+                consecutive_errors += 1
+                try:
+                    bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
+                except Exception:
+                    pass
+            acc_index = (acc_index + 1) % len(accounts)
+            if self.delay_sec > 10:
+                countdown(self.delay_sec - 10, "Delay")
+            elif self.delay_sec > 0:
+                time.sleep(self.delay_sec)
+
+        safe_print(f"{Colors.GREEN}[W{self.worker_id}] {platform_name} done: {jobs_done} jobs, +{total_earned} VND{Colors.RESET}")
 
     def run(self):
-        if not self.update():
-            self.info['status'] = 'invalid_token'
-            self.push()
-            return
-        self.push()
-        while self.active:
-            for name in platforms:
-                if not self.active:
+        self.update_user_info()
+        while self.running:
+            for platform_name, bot_class in ALL_PROVIDERS:
+                if not self.running:
                     break
-                self.run_platform(name)
-                self.update()
-                self.push()
-                if self.active:
+                safe_print(f"{Colors.BOLD_MAGENTA}[W{self.worker_id}] >>> {platform_name} <<<{Colors.RESET}")
+                self.run_platform(platform_name, bot_class)
+                self.update_user_info()
+                self.stats_queue.put((self.worker_id, self.stats.copy()))
+                if self.running:
                     time.sleep(5)
 
-    def push(self):
-        self.info['last_update'] = datetime.now()
-        self.stats.put((self.wid, self.info.copy()))
-
     def stop(self):
-        self.active = False
+        self.running = False
 
-class Controller:
+# ============================================================================
+# Controller multi
+# ============================================================================
+class JobaoController:
     def __init__(self):
-        self.workers: List[Worker] = []
-        self.stats = queue.Queue()
-        self.active = True
-        self.msgid = None
-        self.webhook = webhook()
+        self.workers = []
+        self.stats_queue = queue.Queue()
+        self.running = True
+        self.webhook_url = get_webhook()
+        self.message_id = None
 
-    def tokens(self) -> List[str]:
-        res: List[str] = []
-        if not os.path.exists(txt):
-            return res
-        with open(txt, 'r', encoding='utf-8') as f:
+    def load_tokens(self) -> List[str]:
+        if not os.path.exists(FILE_AUTH):
+            return []
+        tokens = []
+        with open(FILE_AUTH, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    res.append(line)
-        return res
+                    tokens.append(line)
+        return tokens
 
-    def build(self, token: str) -> Auth:
-        return Auth(
-            token=token,
-            key=config['signing_key'],
-            uid=int(config['user_id']),
-            user=config['username'],
-            dev=config['device_id'],
-        )
-
-    def spawn(self):
-        toks = self.tokens()
-        if not toks:
+    def start_workers(self):
+        tokens = self.load_tokens()
+        if not tokens:
+            safe_print(f"{Colors.RED}File {FILE_AUTH} không có token nào.{Colors.RESET}")
             return
-        for idx, token in enumerate(toks):
+        for idx, token in enumerate(tokens):
             try:
-                auth = self.build(token)
-            except ValueError:
-                continue
-            worker = Worker(auth, idx + 1, self.stats)
-            worker.start()
-            self.workers.append(worker)
-            time.sleep(1)
+                auth = create_auth_from_token(token)
+                w = WorkerThread(auth, idx+1, self.stats_queue)
+                w.start()
+                self.workers.append(w)
+                time.sleep(1)
+            except Exception as e:
+                safe_print(f"{Colors.RED}Worker {idx+1} lỗi: {e}{Colors.RESET}")
 
-    def data(self) -> Dict[int, Dict]:
-        res: Dict[int, Dict] = {}
-        while not self.stats.empty():
-            try:
-                wid, info = self.stats.get_nowait()
-                res[wid] = info
-            except queue.Empty:
-                break
-        return res
-
-    def embed(self, stats: Dict[int, Dict]) -> dict:
-        total = len(self.workers)
-        active = sum(1 for s in stats.values() if s['status'] == 'active')
-        dead = total - active
-        earned = sum(s['total_earned'] for s in stats.values())
-        coin = sum(s['coin'] for s in stats.values())
-        done = sum(s['jobs_done'] for s in stats.values())
-        lines = []
-        for wid, s in stats.items():
-            emoji = "🟢" if s['status'] == 'active' else "🔴"
-            lines.append(
-                f"{emoji} **Worker {wid}** - `{s['username']}`\n"
-                f"   Coin: {s['coin']} | Earned: {s['total_earned']} | Jobs: {s['jobs_done']}\n"
-                f"   Status: {s['status']}"
-            )
-        return {
-            "title": "📊 Golike Multi-Account Status",
-            "description": "\n".join(lines) if lines else "No data",
-            "color": 5814783,
-            "fields": [
-                {"name": "Active Workers", "value": f"{active}/{total}", "inline": True},
-                {"name": "Total Coin", "value": f"{coin}", "inline": True},
-                {"name": "Total Earned", "value": f"{earned}", "inline": True},
-                {"name": "Jobs Completed", "value": f"{done}", "inline": True},
-                {"name": "Dead Workers", "value": f"{dead}", "inline": True},
-            ],
-            "footer": {"text": f"Last update: {datetime.now().strftime('%H:%M:%S')}"},
-        }
-
-    def report(self, stats: Dict[int, Dict]):
-        if not stats or not self.webhook:
+    def send_webhook_report(self, stats_dict):
+        if not self.webhook_url or not stats_dict:
             return
-        payload_data = {
+        total_earned = sum(s.get('total_earned', 0) for s in stats_dict.values())
+        total_coin = sum(s.get('coin', 0) for s in stats_dict.values())
+        jobs = sum(s.get('jobs_done', 0) for s in stats_dict.values())
+        desc = "\n".join([f"W{wid}: {s['username']} - {s['status']} - Earned: {s['total_earned']}" for wid, s in stats_dict.items()])
+        payload = {
             "content": None,
-            "embeds": [self.embed(stats)],
-            "username": "Job Ảo Monitor",
+            "embeds": [{
+                "title": "📊 Golike Multi Status",
+                "description": desc[:4000],
+                "color": 5814783,
+                "fields": [
+                    {"name": "Total Earned", "value": f"{total_earned} VND", "inline": True},
+                    {"name": "Total Coin", "value": f"{total_coin}", "inline": True},
+                    {"name": "Jobs Done", "value": f"{jobs}", "inline": True},
+                ],
+                "footer": {"text": datetime.now().strftime("%H:%M:%S")}
+            }]
         }
         try:
-            if self.msgid:
-                resp = requests.patch(f"{self.webhook}/messages/{self.msgid}", json=payload_data, impersonate="chrome")
-                if resp.status_code != 200:
-                    resp = requests.post(self.webhook, json=payload_data, impersonate="chrome")
+            if self.message_id:
+                url = f"{self.webhook_url}/messages/{self.message_id}"
+                resp = requests.patch(url, json=payload)
+                if resp.status_code not in (200, 204):
+                    resp = requests.post(self.webhook_url, json=payload)
                     if resp.status_code == 200:
-                        self.msgid = resp.json().get('id')
+                        self.message_id = resp.json().get('id')
             else:
-                resp = requests.post(self.webhook, json=payload_data, impersonate="chrome")
+                resp = requests.post(self.webhook_url, json=payload)
                 if resp.status_code == 200:
-                    self.msgid = resp.json().get('id')
-        except Exception:
-            pass
+                    self.message_id = resp.json().get('id')
+        except Exception as e:
+            safe_print(f"{Colors.RED}Webhook error: {e}{Colors.RESET}")
 
-    def monitor(self):
-        last = 0
-        while self.active:
+    def monitor_loop(self):
+        last_report = 0
+        while self.running:
             time.sleep(10)
-            stats = self.data()
+            stats = {}
+            while not self.stats_queue.empty():
+                wid, s = self.stats_queue.get_nowait()
+                stats[wid] = s
             now = time.time()
-            if now - last >= 600:
-                self.report(stats)
-                last = now
-
-    def stop(self):
-        self.active = False
-        for w in self.workers:
-            w.stop()
-        for w in self.workers:
-            w.join(timeout=5)
+            if now - last_report >= 600 and stats:
+                self.send_webhook_report(stats)
+                last_report = now
 
     def run(self):
-        banner()
-        self.spawn()
+        show_banner()
+        self.start_workers()
         if not self.workers:
             return
-        thread = threading.Thread(target=self.monitor, daemon=True)
-        thread.start()
+        monitor = threading.Thread(target=self.monitor_loop, daemon=True)
+        monitor.start()
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            self.stop()
-            stats = self.data()
-            self.report(stats)
+            safe_print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
+            for w in self.workers:
+                w.stop()
+            for w in self.workers:
+                w.join(timeout=3)
+            stats = {}
+            while not self.stats_queue.empty():
+                wid, s = self.stats_queue.get_nowait()
+                stats[wid] = s
+            self.send_webhook_report(stats)
 
-def configure():
-    while True:
-        say(f"\n{color.white}── Job settings ──{color.reset}")
-        say(f"  so_luong_job = {color.yellow}{config['so_luong_job']}{color.reset}")
-        say(f"  delay_giay   = {color.yellow}{config['delay_giay']}{color.reset}")
-        say(f"  dung_sau_loi = {color.yellow}{config['dung_sau_loi']}{color.reset}")
-        idx = choice(
-            "Chỉnh cấu hình job:",
-            [
-                f"Số job / platform  (hiện: {config['so_luong_job']})",
-                f"Delay giây         (hiện: {config['delay_giay']})",
-                f"Dừng sau N lỗi    (hiện: {config['dung_sau_loi']})",
-            ],
-        )
-        if idx == -1:
-            return
-        if idx == 0:
-            v = ask("Số job / platform", str(config['so_luong_job']))
-            try:
-                put('so_luong_job', max(1, int(v)))
-            except ValueError:
-                pass
-        elif idx == 1:
-            v = ask("Delay (giây)", str(config['delay_giay']))
-            try:
-                put('delay_giay', max(0, int(v)))
-            except ValueError:
-                pass
-        elif idx == 2:
-            v = ask("Dừng sau N lỗi", str(config['dung_sau_loi']))
-            try:
-                put('dung_sau_loi', max(1, int(v)))
-            except ValueError:
-                pass
+# ============================================================================
+# Headless run
+# ============================================================================
+def run_headless(platform_arg: str) -> int:
+    show_banner()
+    auth = get_auth_from_config()
+    if auth is None:
+        safe_print(f"{Colors.RED}Chưa có token hợp lệ trong config.json.{Colors.RESET}")
+        safe_print(f"{Colors.YELLOW}Chạy `python main.py` để nhập token trước.{Colors.RESET}")
+        return 1
+    only_platform = None if platform_arg.lower() == "all" else platform_arg
+    runner = SingleAccountRunner(auth)
+    runner.run(only_platform=only_platform)
+    return 0
 
-def keys():
-    say(f"\n{color.white}── Cấu hình tài khoản Golike ──{color.reset}")
-    say(f"  username    = {color.yellow}{config.get('username', '')}")
-    say(f"  user_id     = {color.yellow}{config.get('user_id', 0)}")
-    idx = choice(
-        "Chỉnh tài khoản:",
-        [
-            "Đổi tài khoản đăng nhập (nhập user/pass mới)",
-            "Xoá thông tin đăng nhập",
-        ],
-    )
-    if idx == -1:
-        return
-    if idx == 0:
-        user = ask("Nhập tài khoản Golike", "")
-        pwd = ask("Nhập mật khẩu Golike", "")
-        put("username", user)
-        put("password", pwd)
-        say(f"\n{color.cyan}  Đang kiểm tra thông tin đăng nhập mới...{color.reset}")
-        res = login(user, pwd)
-        if res.get("ok"):
-            put("token", res.get("token"))
-            put("signing_key", res.get("key"))
-            put("device_id", res.get("device"))
-            put("user_id", res.get("id"))
-            say(f"{color.green}✓ Cập nhật tài khoản thành công!{color.reset}")
-        else:
-            say(f"{color.red}Đăng nhập thất bại: {res.get('msg')}{color.reset}")
-    elif idx == 1:
-        for k in ('token', 'signing_key', 'user_id', 'username', 'device_id', 'password'):
-            put(k, "" if k != 'user_id' else 0)
-        say(f"{color.yellow}Đã xoá thông tin tài khoản.{color.reset}")
-
-def hooks():
-    current = config.get('webhook_url', '')
-    say(f"\n{color.white}── Discord Webhook ──{color.reset}")
-    say(f"  Hiện tại: {color.cyan}{mask(current, keep=16)}{color.reset}")
-    idx = choice(
-        "Chỉnh Webhook:",
-        [
-            "Đổi / đặt webhook URL",
-            "Tắt webhook (set rỗng)",
-            "Test gửi 1 message",
-        ],
-    )
-    if idx == -1:
-        return
-    if idx == 0:
-        val = ask("Webhook URL mới", current)
-        put('webhook_url', val.strip())
-    elif idx == 1:
-        put('webhook_url', '')
-    elif idx == 2:
-        val = current.strip()
-        if not val:
-            return
-        try:
-            resp = requests.post(val, json={"content": "✅ Test webhook từ Golike Tool", "username": "Job Ảo Monitor"}, impersonate="chrome")
-        except Exception:
-            pass
-
-def show():
-    say(f"\n{color.white}── config.json ──{color.reset}")
-    say(f"  token        = {mask(config.get('token', ''))}")
-    say(f"  signing_key  = {mask(config.get('signing_key', ''), 6)}")
-    say(f"  user_id      = {color.yellow}{config.get('user_id', 0)}")
-    say(f"  username     = {color.yellow}{config.get('username', '')}")
-    say(f"  device_id    = {color.yellow}{config.get('device_id', '')}")
-    say(f"  webhook_url  = {mask(config.get('webhook_url', ''), keep=20)}")
-    say(f"  so_luong_job = {color.yellow}{config['so_luong_job']}")
-    say(f"  delay_giay   = {color.yellow}{config['delay_giay']}")
-    say(f"  dung_sau_loi = {color.yellow}{config['dung_sau_loi']}")
-
-def menu():
-    while True:
-        idx = choice(
-            "Cấu hình:",
-            [
-                "GolikeAuth (5 trường)",
-                "Discord Webhook",
-                "Job settings (số job / delay / max errors)",
-                "Xem toàn bộ config hiện tại",
-            ],
-        )
-        if idx == -1:
-            return
-        if idx == 0:
-            keys()
-        elif idx == 1:
-            hooks()
-        elif idx == 2:
-            configure()
-        elif idx == 3:
-            show()
-
-def ensure(ask_anyway: bool = False):
-    if ask_anyway or not webhook():
-        if ask_anyway:
-            say(f"\n{color.white}── Discord Webhook ──{color.reset}")
-        url = ask("Discord Webhook URL (Enter = bỏ qua / tắt)", config.get('webhook_url', ''))
-        put('webhook_url', url.strip())
-    return config['webhook_url']
-
-def setup() -> Auth:
-    init()
-    user = config.get("username") or ""
-    pwd = config.get("password") or ""
-    if not user or not pwd:
-        say(f"\n{color.cyan}── Đăng nhập Golike tự động 100% ──{color.reset}")
-        user = ask("Nhập tài khoản Golike", "")
-        pwd = ask("Nhập mật khẩu Golike", "")
-        put("username", user)
-        put("password", pwd)
-    say(f"\n{color.cyan}  Đang tự động đăng nhập Golike...{color.reset}")
-    res = login(user, pwd)
-    if not res.get("ok"):
-        say(f"{color.red}  Đăng nhập thất bại: {res.get('msg')}{color.reset}")
-        put("username", "")
-        put("password", "")
-        return setup()
-    auth = Auth(
-        token=res.get("token"),
-        key=res.get("key"),
-        uid=res.get("id"),
-        user=res.get("name"),
-        dev=res.get("device"),
-    )
-    auth.store()
-    say(f"{color.green}  Đăng nhập thành công! Chào sếp {auth.user}{color.reset}")
-    if not webhook():
-        if ask("Bạn có muốn cấu hình Discord Webhook? (y/N)", "n").lower() == "y":
-            ensure()
-    return auth
-
-def single(auth: Auth):
-    runner = Runner(auth)
-    idx = choice(
-        "Chạy 1 account:",
-        [
-            "Chạy tất cả platforms (vòng lặp vô hạn)",
-            "Chọn 1 platform cụ thể",
-            "Chỉ liệt kê accounts (không chạy job)",
-            "Xem profile",
-        ],
-    )
-    if idx == -1:
-        return
-    if idx == 3:
-        runner.profile()
-    elif idx == 2:
-        runner.list()
-    elif idx == 1:
-        options = [name.upper() for name in platforms]
-        platform_idx = choice("Chọn platform:", options)
-        if platform_idx != -1:
-            runner.start(plat=platforms[platform_idx])
+# ============================================================================
+# Menu
+# ============================================================================
+def configure_debug():
+    current = is_debug_enabled()
+    safe_print(f"\nDebug hiện tại: {'BẬT' if current else 'TẮT'}")
+    if ask("Bật debug? (y/N)", "n").lower() == "y":
+        set_field("debug", True)
+        safe_print(f"{Colors.GREEN}Đã bật debug.{Colors.RESET}")
     else:
-        runner.start()
+        set_field("debug", False)
+        safe_print(f"{Colors.YELLOW}Đã tắt debug.{Colors.RESET}")
 
-def multi():
-    if not os.path.exists(txt):
-        return
-    if not webhook():
-        if ask("Vào cấu hình webhook ngay? (y/N)", "n").lower() == "y":
-            hooks()
-    Controller().run()
+def configure_jobs():
+    while True:
+        safe_print(f"\n{Colors.BOLD_WHITE}Job settings:{Colors.RESET}")
+        safe_print(f"  so_luong_job = {CONFIG['so_luong_job']}")
+        safe_print(f"  delay_giay   = {CONFIG['delay_giay']}")
+        safe_print(f"  dung_sau_loi = {CONFIG['dung_sau_loi']}")
+        idx = ask_choice("Chỉnh:", [
+            f"Số job (hiện {CONFIG['so_luong_job']})",
+            f"Delay (hiện {CONFIG['delay_giay']})",
+            f"Max lỗi (hiện {CONFIG['dung_sau_loi']})",
+            "Quay lại"
+        ])
+        if idx in (-1, 3): break
+        if idx == 0:
+            v = ask("Số job", str(CONFIG['so_luong_job']))
+            try: set_field('so_luong_job', max(1, int(v)))
+            except: pass
+        elif idx == 1:
+            v = ask("Delay (s)", str(CONFIG['delay_giay']))
+            try: set_field('delay_giay', max(0, int(v)))
+            except: pass
+        elif idx == 2:
+            v = ask("Max lỗi", str(CONFIG['dung_sau_loi']))
+            try: set_field('dung_sau_loi', max(1, int(v)))
+            except: pass
 
-def profile(auth: Auth):
-    Runner(auth).profile()
+def configure_webhook():
+    current = get_webhook()
+    safe_print(f"\nWebhook hiện tại: {mask(current, 16)}")
+    idx = ask_choice("Webhook:", ["Đặt URL mới", "Tắt (xóa)", "Test gửi", "Quay lại"])
+    if idx in (-1, 3): return
+    if idx == 0:
+        url = ask("URL", current)
+        set_field('webhook_url', url.strip())
+    elif idx == 1:
+        set_field('webhook_url', '')
+    elif idx == 2:
+        if not current:
+            safe_print(f"{Colors.RED}Chưa có URL.{Colors.RESET}")
+        else:
+            try:
+                r = requests.post(current, json={"content": "Test"})
+                safe_print(f"{Colors.GREEN}OK {r.status_code}{Colors.RESET}" if r.status_code in (200,204) else f"{Colors.RED}Lỗi {r.status_code}{Colors.RESET}")
+            except Exception as e:
+                safe_print(f"{Colors.RED}{e}{Colors.RESET}")
 
-def accs(auth: Auth):
-    runner = Runner(auth)
-    if runner.profile():
-        runner.list()
+def configure_auth():
+    safe_print(f"\nToken hiện tại: {mask(CONFIG.get('token',''))}")
+    if ask("Đổi token? (y/N)", "n").lower() == "y":
+        auth = prompt_auth()
+        CONFIG["token"] = auth.token
+        CONFIG["username"] = auth.username
+        CONFIG["user_id"] = auth.user_id
+        save_config(CONFIG)
+        safe_print(f"{Colors.GREEN}Đã cập nhật token.{Colors.RESET}")
 
+def main_menu(auth: GolikeAuth):
+    while True:
+        idx = ask_choice("Chọn:", [
+            "Chạy 1 account (single)",
+            "Chạy multi từ au.txt",
+            "Xem profile",
+            "Liệt kê accounts",
+            "Cấu hình"
+        ], allow_back=False)
+        if idx == 0:
+            runner = SingleAccountRunner(auth)
+            p = ask_choice("Platform:", [name for name,_ in ALL_PROVIDERS] + ["Tất cả"])
+            if p == -1: continue
+            if p == len(ALL_PROVIDERS):
+                runner.run()
+            else:
+                runner.run(only_platform=ALL_PROVIDERS[p][0])
+        elif idx == 1:
+            JobaoController().run()
+        elif idx == 2:
+            SingleAccountRunner(auth).show_profile()
+        elif idx == 3:
+            SingleAccountRunner(auth).list_accounts()
+        elif idx == 4:
+            c = ask_choice("Cấu hình:", ["GolikeAuth (token)", "Webhook", "Debug", "Job settings", "Quay lại"])
+            if c == 0: configure_auth()
+            elif c == 1: configure_webhook()
+            elif c == 2: configure_debug()
+            elif c == 3: configure_jobs()
+
+# ============================================================================
+# Main
+# ============================================================================
 def main():
-    banner()
-    try:
-        auth = setup()
-        while True:
-            idx = choice(
-                "Chọn tính năng:",
-                [
-                    "Chạy 1 account (single mode)",
-                    "Chạy multi-account từ au.txt (multi-thread)",
-                    "Xem profile",
-                    "Liệt kê accounts của từng platform",
-                    "Cấu hình (GolikeAuth / Webhook / Jobs)",
-                ],
-                allow=False,
-            )
-            if idx == 0:
-                single(auth)
-            elif idx == 1:
-                multi()
-            elif idx == 2:
-                profile(auth)
-            elif idx == 3:
-                accs(auth)
-            elif idx == 4:
-                menu()
-    except KeyboardInterrupt:
-        say(f"\n{color.yellow}Thoát.{color.reset}")
+    args = argparse.ArgumentParser()
+    args.add_argument("--run", help="all hoặc platform")
+    parsed = args.parse_args()
+    if parsed.run:
+        sys.exit(run_headless(parsed.run))
+    show_banner()
+    auth = get_auth_from_config()
+    if auth is None:
+        safe_print(f"{Colors.YELLOW}Chưa có token, nhập ngay.{Colors.RESET}")
+        auth = prompt_auth()
+    main_menu(auth)
 
 if __name__ == "__main__":
     main()
