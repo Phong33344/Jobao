@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Golike Job Ảo - Single file, chỉ hỗ trợ: Twitter, Threads, LinkedIn, Pinterest, Snapchat
-Dùng golike-gauth 0.1.13, bật sig + captcha tự động.
+Đã chuyển đổi sang cơ chế đăng nhập bằng Tài Khoản & Mật Khẩu
 """
 
 import os
@@ -46,7 +46,7 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 # ============================================================================
-# Debug API logger — bọc auth.get / auth.post, in request + response đầy đủ
+# Debug API logger
 # ============================================================================
 def _dump_request(method: str, url: str, params=None, json_body=None, headers=None):
     safe_print(f"\n{Colors.BOLD_MAGENTA}{'─'*60}")
@@ -77,7 +77,6 @@ def _dump_response(resp):
     safe_print(f"{'─'*60}{Colors.RESET}\n")
 
 def debug_get(auth, path: str, params=None):
-    """auth.get wrapper với debug dump."""
     resp = auth.get(path, params=params)
     if is_debug_enabled():
         base = getattr(auth, 'base_url', 'https://gateway.golike.net/api')
@@ -88,7 +87,6 @@ def debug_get(auth, path: str, params=None):
     return resp
 
 def debug_post(auth, path: str, json_body=None):
-    """auth.post wrapper với debug dump."""
     resp = auth.post(path, json=json_body)
     if is_debug_enabled():
         base = getattr(auth, 'base_url', 'https://gateway.golike.net/api')
@@ -150,7 +148,8 @@ def mask(s: str, keep: int = 8) -> str:
 # ============================================================================
 FILE_CONFIG = 'config.json'
 DEFAULT_CONFIG = {
-    "token": "",
+    "username": "",
+    "password": "",
     "webhook_url": "",
     "debug": False,
     "so_luong_job": 1000,
@@ -171,8 +170,8 @@ def load_config():
         for k, v in DEFAULT_CONFIG.items():
             if k not in data:
                 data[k] = v
-        # Xóa các key cũ
-        for old in ("signing_key", "user_id", "username", "device_id", "g_version"):
+        # Xóa các key cũ liên quan đến bản cũ
+        for old in ("signing_key", "user_id", "token", "device_id", "g_version"):
             data.pop(old, None)
         save_config(data)
         return data
@@ -201,8 +200,31 @@ def is_debug_enabled() -> bool:
     return bool(CONFIG.get("debug", False))
 
 # ============================================================================
-# GolikeAuth wrapper
+# Golike Login & Auth Wrapper
 # ============================================================================
+def get_token_from_login(username, password) -> Optional[str]:
+    url = "https://gateway.golike.net/api/authorization/login"
+    headers = {
+        "Content-Type": "application/json",
+        "t": "FCM",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    }
+    payload = {
+        "username": username,
+        "password": password
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        data = resp.json()
+        if resp.status_code == 200 and data.get("status") == 200:
+            token = data.get("data", {}).get("token") or data.get("data", {}).get("authorization")
+            if token:
+                return str(token)
+        safe_print(f"{Colors.RED}Đăng nhập thất bại ({username}): {data.get('message', 'Sai thông tin')}{Colors.RESET}")
+    except Exception as e:
+        safe_print(f"{Colors.RED}Lỗi kết nối khi đăng nhập ({username}): {e}{Colors.RESET}")
+    return None
+
 def create_auth_from_token(token: str) -> GolikeAuth:
     return GolikeAuth.from_token(
         token,
@@ -213,39 +235,49 @@ def create_auth_from_token(token: str) -> GolikeAuth:
     )
 
 def get_auth_from_config() -> Optional[GolikeAuth]:
-    token = (CONFIG.get("token") or "").strip()
+    username = (CONFIG.get("username") or "").strip()
+    password = (CONFIG.get("password") or "").strip()
+    if not username or not password:
+        return None
+    
+    safe_print(f"{Colors.YELLOW}Đang tự động đăng nhập user: {username}...{Colors.RESET}")
+    token = get_token_from_login(username, password)
     if not token:
         return None
+        
     try:
         auth = create_auth_from_token(token)
-        CONFIG["username"] = auth.username
-        CONFIG["user_id"] = auth.user_id
-        save_config(CONFIG)
         return auth
     except Exception as e:
-        safe_print(f"{Colors.RED}Lỗi tạo auth từ token: {e}{Colors.RESET}")
+        safe_print(f"{Colors.RED}Lỗi tạo auth sau khi lấy token: {e}{Colors.RESET}")
         return None
 
-def prompt_auth() -> GolikeAuth:
+def prompt_login() -> GolikeAuth:
     safe_print(f"\n{Colors.BOLD_WHITE}{'='*60}{Colors.RESET}")
-    safe_print(f"{Colors.BOLD_CYAN}  Nhập JWT token (Bearer){Colors.RESET}")
+    safe_print(f"{Colors.BOLD_CYAN}  Đăng nhập Golike (Tài khoản & Mật khẩu){Colors.RESET}")
     safe_print(f"{Colors.BOLD_WHITE}{'='*60}{Colors.RESET}")
     while True:
-        token = ask("JWT token", "").strip()
-        if not token:
-            safe_print(f"{Colors.RED}Token không được rỗng.{Colors.RESET}")
+        username = ask("Tên đăng nhập", "").strip()
+        password = ask("Mật khẩu", "").strip()
+        if not username or not password:
+            safe_print(f"{Colors.RED}Tài khoản và mật khẩu không được rỗng.{Colors.RESET}")
             continue
+        
+        safe_print(f"{Colors.YELLOW}Đang tiến hành đăng nhập...{Colors.RESET}")
+        token = get_token_from_login(username, password)
+        if not token:
+            safe_print(f"{Colors.YELLOW}Vui lòng thử lại.{Colors.RESET}")
+            continue
+
         try:
             auth = create_auth_from_token(token)
-            break
+            CONFIG["username"] = username
+            CONFIG["password"] = password
+            save_config(CONFIG)
+            safe_print(f"{Colors.GREEN}✓ Đăng nhập thành công (ID: {auth.user_id}){Colors.RESET}")
+            return auth
         except Exception as e:
-            safe_print(f"{Colors.RED}Lỗi: {e}. Thử lại.{Colors.RESET}")
-    CONFIG["token"] = token
-    CONFIG["username"] = auth.username
-    CONFIG["user_id"] = auth.user_id
-    save_config(CONFIG)
-    safe_print(f"{Colors.GREEN}✓ Đã tạo auth thành công cho user {auth.username} (ID: {auth.user_id}){Colors.RESET}")
-    return auth
+            safe_print(f"{Colors.RED}Lỗi khởi tạo token: {e}. Thử lại.{Colors.RESET}")
 
 # ============================================================================
 # Base Provider
@@ -280,227 +312,98 @@ class BaseProviderBot:
         return str(acc.get('id', 'N/A'))
 
 # ============================================================================
-# Các lớp provider cụ thể (chỉ 5 platform)
+# Các lớp provider cụ thể
 # ============================================================================
 class TwitterBot(BaseProviderBot):
     platform = "twitter"
-
     def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = debug_get(
-                self.auth,
-                "/advertising/publishers/twitter/jobs",
-                params={"account_id": account_id}
-            )
+            resp = debug_get(self.auth, "/advertising/publishers/twitter/jobs", params={"account_id": account_id})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
             job_type = (job_data or {}).get('type', '')
             if job_type == 'comment':
                 comment_run = (job_data or {}).get('comment_run') or {}
-                comment_id  = comment_run.get('id')       # top-level field
-                message     = comment_run.get('message') or ''
-                body = {
-                    "ads_id":      ads_id,
-                    "account_id":  account_id,
-                    "async":       True,
-                    "comment_id":  comment_id,   # required — id từ comment_run
-                    "message":     message,       # required — text comment
-                }
+                body = {"ads_id": ads_id, "account_id": account_id, "async": True, "comment_id": comment_run.get('id'), "message": comment_run.get('message') or ''}
             else:
-                body = {
-                    "ads_id":     ads_id,
-                    "account_id": account_id,
-                    "async":      True,
-                    "data":       None,
-                }
-            resp = debug_post(
-                self.auth,
-                "/advertising/publishers/twitter/complete-jobs",
-                json_body=body
-            )
+                body = {"ads_id": ads_id, "account_id": account_id, "async": True, "data": None}
+            resp = debug_post(self.auth, "/advertising/publishers/twitter/complete-jobs", json_body=body)
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def skip_job(self, ads_id: int, object_id: str, account_id: int):
-        try:
-            debug_post(
-                self.auth,
-                "/advertising/publishers/twitter/skip-jobs",
-                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
-            )
-        except Exception:
-            pass
+        try: debug_post(self.auth, "/advertising/publishers/twitter/skip-jobs", json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id})
+        except Exception: pass
 
 class ThreadsBot(BaseProviderBot):
     platform = "threads"
-
     def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = debug_get(
-                self.auth,
-                "/advertising/publishers/threads/jobs",
-                params={"account_id": account_id}
-            )
+            resp = debug_get(self.auth, "/advertising/publishers/threads/jobs", params={"account_id": account_id})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
-            job_type = (job_data or {}).get('type', '')
-            if job_type == 'comment':
-                message = (job_data.get('comment_run') or {}).get('message') or ''
-                data_field = {"message": message} if message else None
-            else:
-                data_field = None
-            resp = debug_post(
-                self.auth,
-                "/advertising/publishers/threads/complete-jobs",
-                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
-            )
+            data_field = {"message": (job_data.get('comment_run') or {}).get('message') or ''} if (job_data or {}).get('type', '') == 'comment' else None
+            resp = debug_post(self.auth, "/advertising/publishers/threads/complete-jobs", json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def skip_job(self, ads_id: int, object_id: str, account_id: int):
-        try:
-            debug_post(
-                self.auth,
-                "/advertising/publishers/threads/skip-jobs",
-                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
-            )
-        except Exception:
-            pass
+        try: debug_post(self.auth, "/advertising/publishers/threads/skip-jobs", json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id})
+        except Exception: pass
 
 class LinkedInBot(BaseProviderBot):
     platform = "linkedin"
-
     def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = debug_get(
-                self.auth,
-                "/advertising/publishers/linkedin/jobs",
-                params={"account_id": account_id}
-            )
+            resp = debug_get(self.auth, "/advertising/publishers/linkedin/jobs", params={"account_id": account_id})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
-            job_type = (job_data or {}).get('type', '')
-            if job_type == 'comment':
-                message = (job_data.get('comment_run') or {}).get('message') or ''
-                data_field = {"message": message} if message else None
-            else:
-                data_field = None
-            resp = debug_post(
-                self.auth,
-                "/advertising/publishers/linkedin/complete-jobs",
-                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
-            )
+            data_field = {"message": (job_data.get('comment_run') or {}).get('message') or ''} if (job_data or {}).get('type', '') == 'comment' else None
+            resp = debug_post(self.auth, "/advertising/publishers/linkedin/complete-jobs", json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def skip_job(self, ads_id: int, object_id: str, account_id: int):
-        try:
-            debug_post(
-                self.auth,
-                "/advertising/publishers/linkedin/skip-jobs",
-                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
-            )
-        except Exception:
-            pass
+        try: debug_post(self.auth, "/advertising/publishers/linkedin/skip-jobs", json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id})
+        except Exception: pass
 
 class PinterestBot(BaseProviderBot):
     platform = "pinterest"
-
     def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = debug_get(
-                self.auth,
-                "/advertising/publishers/pinterest/jobs",
-                params={"account_id": account_id}
-            )
+            resp = debug_get(self.auth, "/advertising/publishers/pinterest/jobs", params={"account_id": account_id})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
-            job_type = (job_data or {}).get('type', '')
-            if job_type == 'comment':
-                message = (job_data.get('comment_run') or {}).get('message') or ''
-                data_field = {"message": message} if message else None
-            else:
-                data_field = None
-            resp = debug_post(
-                self.auth,
-                "/advertising/publishers/pinterest/complete-jobs",
-                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
-            )
+            data_field = {"message": (job_data.get('comment_run') or {}).get('message') or ''} if (job_data or {}).get('type', '') == 'comment' else None
+            resp = debug_post(self.auth, "/advertising/publishers/pinterest/complete-jobs", json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def skip_job(self, ads_id: int, object_id: str, account_id: int):
-        try:
-            debug_post(
-                self.auth,
-                "/advertising/publishers/pinterest/skip-jobs",
-                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
-            )
-        except Exception:
-            pass
+        try: debug_post(self.auth, "/advertising/publishers/pinterest/skip-jobs", json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id})
+        except Exception: pass
 
 class SnapchatBot(BaseProviderBot):
     platform = "snapchat"
-
     def get_job(self, account_id: str) -> Optional[Dict]:
         try:
-            resp = debug_get(
-                self.auth,
-                "/advertising/publishers/snapchat/jobs",
-                params={"account_id": account_id}
-            )
+            resp = debug_get(self.auth, "/advertising/publishers/snapchat/jobs", params={"account_id": account_id})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def complete_job(self, ads_id: int, account_id: int, job_data: Optional[Dict] = None) -> Optional[Dict]:
         try:
-            job_type = (job_data or {}).get('type', '')
-            if job_type == 'comment':
-                message = (job_data.get('comment_run') or {}).get('message') or ''
-                data_field = {"message": message} if message else None
-            else:
-                data_field = None
-            resp = debug_post(
-                self.auth,
-                "/advertising/publishers/snapchat/complete-jobs",
-                json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field}
-            )
+            data_field = {"message": (job_data.get('comment_run') or {}).get('message') or ''} if (job_data or {}).get('type', '') == 'comment' else None
+            resp = debug_post(self.auth, "/advertising/publishers/snapchat/complete-jobs", json_body={"ads_id": ads_id, "account_id": account_id, "async": True, "data": data_field})
             return resp.json() if resp.status_code == 200 else None
-        except Exception:
-            return None
-
+        except Exception: return None
     def skip_job(self, ads_id: int, object_id: str, account_id: int):
-        try:
-            debug_post(
-                self.auth,
-                "/advertising/publishers/snapchat/skip-jobs",
-                json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id}
-            )
-        except Exception:
-            pass
+        try: debug_post(self.auth, "/advertising/publishers/snapchat/skip-jobs", json_body={"ads_id": ads_id, "object_id": object_id, "account_id": account_id})
+        except Exception: pass
 
-# Danh sách platform được hỗ trợ
 ALL_PROVIDERS = [
     ("Twitter", TwitterBot),
     ("Threads", ThreadsBot),
@@ -547,7 +450,7 @@ class SingleAccountRunner:
                 safe_print(f"{Colors.BOLD_CYAN}  Coin     : {Colors.BOLD_YELLOW}{self.stats['coin']}{Colors.RESET}")
                 safe_print(f"{Colors.BOLD_GREEN}{'='*60}{Colors.RESET}\n")
                 return True
-            safe_print(f"{Colors.RED}Token không hợp lệ!{Colors.RESET}")
+            safe_print(f"{Colors.RED}Phiên bản không hợp lệ!{Colors.RESET}")
             return False
         except Exception as e:
             safe_print(f"{Colors.RED}Lỗi lấy profile: {e}{Colors.RESET}")
@@ -580,9 +483,6 @@ class SingleAccountRunner:
             return 0
 
         safe_print(f"\n{Colors.GREEN}{platform_name}: {len(accounts)} tài khoản{Colors.RESET}")
-        for i, acc in enumerate(accounts):
-            safe_print(f"  [{i}] {bot.account_display_name(acc, i)} (ID: {bot.account_id(acc)})")
-
         account_errors = {bot.account_id(acc): 0 for acc in accounts}
         consecutive_errors = 0
         acc_index = 0
@@ -592,7 +492,6 @@ class SingleAccountRunner:
         for i in range(self.jobs_target):
             if not self.running or consecutive_errors >= self.max_errors:
                 break
-
             attempts = 0
             while attempts < len(accounts):
                 cur = accounts[acc_index]
@@ -609,7 +508,6 @@ class SingleAccountRunner:
             acc_id = bot.account_id(cur_acc)
             acc_name = bot.account_display_name(cur_acc, acc_index)
 
-            # Gọi get_job với account_id
             job_json = bot.get_job(account_id=acc_id)
             job_data = job_json.get('data') if job_json and job_json.get('status') == 200 else None
 
@@ -654,36 +552,29 @@ class SingleAccountRunner:
                 safe_print(f"{Colors.RED}Failed sau 3 lần! Switching...{Colors.RESET}")
                 account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
                 consecutive_errors += 1
-                try:
-                    bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
-                except Exception:
-                    pass
+                try: bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
+                except Exception: pass
 
             acc_index = (acc_index + 1) % len(accounts)
-            if self.delay_sec > 10:
-                countdown(self.delay_sec - 10, "Delay")
-            elif self.delay_sec > 0:
-                time.sleep(self.delay_sec)
+            if self.delay_sec > 10: countdown(self.delay_sec - 10, "Delay")
+            elif self.delay_sec > 0: time.sleep(self.delay_sec)
 
         safe_print(f"{Colors.BOLD_GREEN}{platform_name} hoàn thành: {jobs_done} jobs | +{total_earned} VND{Colors.RESET}")
         return jobs_done
 
     def run(self, only_platform: Optional[str] = None):
-        if not self.show_profile():
-            return
+        if not self.show_profile(): return
         while self.running:
             for platform_name, _ in ALL_PROVIDERS:
                 if not self.running: break
                 if only_platform and platform_name.lower() != only_platform.lower(): continue
                 safe_print(f"\n{Colors.BOLD_MAGENTA}>>> {platform_name} <<<{Colors.RESET}")
                 self.run_platform(platform_name)
-                if only_platform:
-                    return
-                if self.running:
-                    time.sleep(5)
+                if only_platform: return
+                if self.running: time.sleep(5)
 
 # ============================================================================
-# Multi-worker (dùng nhiều token từ au.txt)
+# Multi-worker (dùng username|password từ au.txt)
 # ============================================================================
 FILE_AUTH = 'au.txt'
 
@@ -715,7 +606,7 @@ class WorkerThread(threading.Thread):
                 self.stats['coin'] = data.get('coin', 0)
                 self.stats['status'] = 'active'
                 return True
-            self.stats['status'] = 'invalid_token'
+            self.stats['status'] = 'invalid_session'
             return False
         except Exception:
             self.stats['status'] = 'error'
@@ -724,11 +615,9 @@ class WorkerThread(threading.Thread):
     def run_platform(self, platform_name: str, bot_class):
         bot = bot_class(self.auth)
         accs = bot.get_accounts()
-        if not accs or accs.get('status') != 200:
-            return
+        if not accs or accs.get('status') != 200: return
         accounts = accs.get('data', [])
-        if not accounts:
-            return
+        if not accounts: return
         account_errors = {bot.account_id(acc): 0 for acc in accounts}
         consecutive_errors = 0
         acc_index = 0
@@ -736,25 +625,20 @@ class WorkerThread(threading.Thread):
         total_earned = 0
 
         for i in range(self.jobs_target):
-            if not self.running or consecutive_errors >= self.max_errors:
-                break
+            if not self.running or consecutive_errors >= self.max_errors: break
             attempts = 0
             while attempts < len(accounts):
                 cur = accounts[acc_index]
                 acc_id = bot.account_id(cur)
-                if account_errors.get(acc_id, 0) < 3:
-                    break
+                if account_errors.get(acc_id, 0) < 3: break
                 acc_index = (acc_index + 1) % len(accounts)
                 attempts += 1
-            else:
-                break
+            else: break
             cur_acc = accounts[acc_index]
             acc_id = bot.account_id(cur_acc)
-            acc_name = bot.account_display_name(cur_acc, acc_index)
 
             job_json = bot.get_job(account_id=acc_id)
             job_data = job_json.get('data') if job_json and job_json.get('status') == 200 else None
-
             if not job_data:
                 account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
                 consecutive_errors += 1
@@ -782,22 +666,16 @@ class WorkerThread(threading.Thread):
                         account_errors[acc_id] = 0
                         consecutive_errors = 0
                         break
-                except Exception:
-                    pass
-                if attempt < 2:
-                    countdown(3, "Retry")
+                except Exception: pass
+                if attempt < 2: countdown(3, "Retry")
             if not success:
                 account_errors[acc_id] = account_errors.get(acc_id, 0) + 1
                 consecutive_errors += 1
-                try:
-                    bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
-                except Exception:
-                    pass
+                try: bot.skip_job(ads_id=ads_id, object_id=object_id, account_id=int(acc_id))
+                except Exception: pass
             acc_index = (acc_index + 1) % len(accounts)
-            if self.delay_sec > 10:
-                countdown(self.delay_sec - 10, "Delay")
-            elif self.delay_sec > 0:
-                time.sleep(self.delay_sec)
+            if self.delay_sec > 10: countdown(self.delay_sec - 10, "Delay")
+            elif self.delay_sec > 0: time.sleep(self.delay_sec)
 
         safe_print(f"{Colors.GREEN}[W{self.worker_id}] {platform_name} done: {jobs_done} jobs, +{total_earned} VND{Colors.RESET}")
 
@@ -805,14 +683,12 @@ class WorkerThread(threading.Thread):
         self.update_user_info()
         while self.running:
             for platform_name, bot_class in ALL_PROVIDERS:
-                if not self.running:
-                    break
+                if not self.running: break
                 safe_print(f"{Colors.BOLD_MAGENTA}[W{self.worker_id}] >>> {platform_name} <<<{Colors.RESET}")
                 self.run_platform(platform_name, bot_class)
                 self.update_user_info()
                 self.stats_queue.put((self.worker_id, self.stats.copy()))
-                if self.running:
-                    time.sleep(5)
+                if self.running: time.sleep(5)
 
     def stop(self):
         self.running = False
@@ -828,24 +704,33 @@ class JobaoController:
         self.webhook_url = get_webhook()
         self.message_id = None
 
-    def load_tokens(self) -> List[str]:
-        if not os.path.exists(FILE_AUTH):
-            return []
-        tokens = []
+    def load_accounts(self) -> List[tuple]:
+        if not os.path.exists(FILE_AUTH): return []
+        accs = []
         with open(FILE_AUTH, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    tokens.append(line)
-        return tokens
+                    if '|' in line:
+                        u, p = line.split('|', 1)
+                        accs.append((u.strip(), p.strip()))
+                    elif ':' in line:
+                        u, p = line.split(':', 1)
+                        accs.append((u.strip(), p.strip()))
+        return accs
 
     def start_workers(self):
-        tokens = self.load_tokens()
-        if not tokens:
-            safe_print(f"{Colors.RED}File {FILE_AUTH} không có token nào.{Colors.RESET}")
+        accs = self.load_accounts()
+        if not accs:
+            safe_print(f"{Colors.RED}File {FILE_AUTH} trống hoặc sai định dạng. Vui lòng điền theo dạng taikhoan|matkhau.{Colors.RESET}")
             return
-        for idx, token in enumerate(tokens):
+        for idx, (user, pwd) in enumerate(accs):
             try:
+                safe_print(f"{Colors.CYAN}[W{idx+1}] Đang đăng nhập: {user}...{Colors.RESET}")
+                token = get_token_from_login(user, pwd)
+                if not token:
+                    safe_print(f"{Colors.RED}[W{idx+1}] Bỏ qua do đăng nhập thất bại.{Colors.RESET}")
+                    continue
                 auth = create_auth_from_token(token)
                 w = WorkerThread(auth, idx+1, self.stats_queue)
                 w.start()
@@ -855,8 +740,7 @@ class JobaoController:
                 safe_print(f"{Colors.RED}Worker {idx+1} lỗi: {e}{Colors.RESET}")
 
     def send_webhook_report(self, stats_dict):
-        if not self.webhook_url or not stats_dict:
-            return
+        if not self.webhook_url or not stats_dict: return
         total_earned = sum(s.get('total_earned', 0) for s in stats_dict.values())
         total_coin = sum(s.get('coin', 0) for s in stats_dict.values())
         jobs = sum(s.get('jobs_done', 0) for s in stats_dict.values())
@@ -877,18 +761,14 @@ class JobaoController:
         }
         try:
             if self.message_id:
-                url = f"{self.webhook_url}/messages/{self.message_id}"
-                resp = requests.patch(url, json=payload)
+                resp = requests.patch(f"{self.webhook_url}/messages/{self.message_id}", json=payload)
                 if resp.status_code not in (200, 204):
                     resp = requests.post(self.webhook_url, json=payload)
-                    if resp.status_code == 200:
-                        self.message_id = resp.json().get('id')
+                    if resp.status_code == 200: self.message_id = resp.json().get('id')
             else:
                 resp = requests.post(self.webhook_url, json=payload)
-                if resp.status_code == 200:
-                    self.message_id = resp.json().get('id')
-        except Exception as e:
-            safe_print(f"{Colors.RED}Webhook error: {e}{Colors.RESET}")
+                if resp.status_code == 200: self.message_id = resp.json().get('id')
+        except Exception: pass
 
     def monitor_loop(self):
         last_report = 0
@@ -906,19 +786,15 @@ class JobaoController:
     def run(self):
         show_banner()
         self.start_workers()
-        if not self.workers:
-            return
+        if not self.workers: return
         monitor = threading.Thread(target=self.monitor_loop, daemon=True)
         monitor.start()
         try:
-            while True:
-                time.sleep(1)
+            while True: time.sleep(1)
         except KeyboardInterrupt:
             safe_print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-            for w in self.workers:
-                w.stop()
-            for w in self.workers:
-                w.join(timeout=3)
+            for w in self.workers: w.stop()
+            for w in self.workers: w.join(timeout=3)
             stats = {}
             while not self.stats_queue.empty():
                 wid, s = self.stats_queue.get_nowait()
@@ -926,32 +802,26 @@ class JobaoController:
             self.send_webhook_report(stats)
 
 # ============================================================================
-# Headless run
+# Headless run & Menu
 # ============================================================================
 def run_headless(platform_arg: str) -> int:
     show_banner()
     auth = get_auth_from_config()
     if auth is None:
-        safe_print(f"{Colors.RED}Chưa có token hợp lệ trong config.json.{Colors.RESET}")
-        safe_print(f"{Colors.YELLOW}Chạy `python main.py` để nhập token trước.{Colors.RESET}")
+        safe_print(f"{Colors.RED}Chưa có cấu hình đăng nhập hợp lệ trong config.json.{Colors.RESET}")
+        safe_print(f"{Colors.YELLOW}Chạy `python main.py` để nhập tài khoản trước.{Colors.RESET}")
         return 1
-    only_platform = None if platform_arg.lower() == "all" else platform_arg
     runner = SingleAccountRunner(auth)
-    runner.run(only_platform=only_platform)
+    runner.run(only_platform=None if platform_arg.lower() == "all" else platform_arg)
     return 0
 
-# ============================================================================
-# Menu
-# ============================================================================
 def configure_debug():
     current = is_debug_enabled()
     safe_print(f"\nDebug hiện tại: {'BẬT' if current else 'TẮT'}")
     if ask("Bật debug? (y/N)", "n").lower() == "y":
-        set_field("debug", True)
-        safe_print(f"{Colors.GREEN}Đã bật debug.{Colors.RESET}")
+        set_field("debug", True); safe_print(f"{Colors.GREEN}Đã bật debug.{Colors.RESET}")
     else:
-        set_field("debug", False)
-        safe_print(f"{Colors.YELLOW}Đã tắt debug.{Colors.RESET}")
+        set_field("debug", False); safe_print(f"{Colors.YELLOW}Đã tắt debug.{Colors.RESET}")
 
 def configure_jobs():
     while True:
@@ -959,24 +829,16 @@ def configure_jobs():
         safe_print(f"  so_luong_job = {CONFIG['so_luong_job']}")
         safe_print(f"  delay_giay   = {CONFIG['delay_giay']}")
         safe_print(f"  dung_sau_loi = {CONFIG['dung_sau_loi']}")
-        idx = ask_choice("Chỉnh:", [
-            f"Số job (hiện {CONFIG['so_luong_job']})",
-            f"Delay (hiện {CONFIG['delay_giay']})",
-            f"Max lỗi (hiện {CONFIG['dung_sau_loi']})",
-            "Quay lại"
-        ])
+        idx = ask_choice("Chỉnh:", [f"Số job (hiện {CONFIG['so_luong_job']})", f"Delay (hiện {CONFIG['delay_giay']})", f"Max lỗi (hiện {CONFIG['dung_sau_loi']})", "Quay lại"])
         if idx in (-1, 3): break
         if idx == 0:
-            v = ask("Số job", str(CONFIG['so_luong_job']))
-            try: set_field('so_luong_job', max(1, int(v)))
+            try: set_field('so_luong_job', max(1, int(ask("Số job", str(CONFIG['so_luong_job'])))))
             except: pass
         elif idx == 1:
-            v = ask("Delay (s)", str(CONFIG['delay_giay']))
-            try: set_field('delay_giay', max(0, int(v)))
+            try: set_field('delay_giay', max(0, int(ask("Delay (s)", str(CONFIG['delay_giay'])))))
             except: pass
         elif idx == 2:
-            v = ask("Max lỗi", str(CONFIG['dung_sau_loi']))
-            try: set_field('dung_sau_loi', max(1, int(v)))
+            try: set_field('dung_sau_loi', max(1, int(ask("Max lỗi", str(CONFIG['dung_sau_loi'])))))
             except: pass
 
 def configure_webhook():
@@ -984,56 +846,33 @@ def configure_webhook():
     safe_print(f"\nWebhook hiện tại: {mask(current, 16)}")
     idx = ask_choice("Webhook:", ["Đặt URL mới", "Tắt (xóa)", "Test gửi", "Quay lại"])
     if idx in (-1, 3): return
-    if idx == 0:
-        url = ask("URL", current)
-        set_field('webhook_url', url.strip())
-    elif idx == 1:
-        set_field('webhook_url', '')
+    if idx == 0: set_field('webhook_url', ask("URL", current).strip())
+    elif idx == 1: set_field('webhook_url', '')
     elif idx == 2:
-        if not current:
-            safe_print(f"{Colors.RED}Chưa có URL.{Colors.RESET}")
+        if not current: safe_print(f"{Colors.RED}Chưa có URL.{Colors.RESET}")
         else:
             try:
                 r = requests.post(current, json={"content": "Test"})
                 safe_print(f"{Colors.GREEN}OK {r.status_code}{Colors.RESET}" if r.status_code in (200,204) else f"{Colors.RED}Lỗi {r.status_code}{Colors.RESET}")
-            except Exception as e:
-                safe_print(f"{Colors.RED}{e}{Colors.RESET}")
+            except Exception as e: safe_print(f"{Colors.RED}{e}{Colors.RESET}")
 
 def configure_auth():
-    safe_print(f"\nToken hiện tại: {mask(CONFIG.get('token',''))}")
-    if ask("Đổi token? (y/N)", "n").lower() == "y":
-        auth = prompt_auth()
-        CONFIG["token"] = auth.token
-        CONFIG["username"] = auth.username
-        CONFIG["user_id"] = auth.user_id
-        save_config(CONFIG)
-        safe_print(f"{Colors.GREEN}Đã cập nhật token.{Colors.RESET}")
+    curr = CONFIG.get("username", "")
+    safe_print(f"\nTài khoản hiện tại: {curr if curr else '(Chưa có)'}")
+    if ask("Đăng nhập tài khoản khác? (y/N)", "n").lower() == "y":
+        prompt_login()
 
 def main_menu(auth: GolikeAuth):
     while True:
-        idx = ask_choice("Chọn:", [
-            "Chạy 1 account (single)",
-            "Chạy multi từ au.txt",
-            "Xem profile",
-            "Liệt kê accounts",
-            "Cấu hình"
-        ], allow_back=False)
+        idx = ask_choice("Chọn:", ["Chạy 1 account (single)", "Chạy multi từ au.txt", "Xem profile", "Liệt kê accounts", "Cấu hình"], allow_back=False)
         if idx == 0:
-            runner = SingleAccountRunner(auth)
             p = ask_choice("Platform:", [name for name,_ in ALL_PROVIDERS] + ["Tất cả"])
-            if p == -1: continue
-            if p == len(ALL_PROVIDERS):
-                runner.run()
-            else:
-                runner.run(only_platform=ALL_PROVIDERS[p][0])
-        elif idx == 1:
-            JobaoController().run()
-        elif idx == 2:
-            SingleAccountRunner(auth).show_profile()
-        elif idx == 3:
-            SingleAccountRunner(auth).list_accounts()
+            if p != -1: SingleAccountRunner(auth).run(only_platform=None if p == len(ALL_PROVIDERS) else ALL_PROVIDERS[p][0])
+        elif idx == 1: JobaoController().run()
+        elif idx == 2: SingleAccountRunner(auth).show_profile()
+        elif idx == 3: SingleAccountRunner(auth).list_accounts()
         elif idx == 4:
-            c = ask_choice("Cấu hình:", ["GolikeAuth (token)", "Webhook", "Debug", "Job settings", "Quay lại"])
+            c = ask_choice("Cấu hình:", ["Tài khoản đăng nhập", "Webhook", "Debug", "Job settings", "Quay lại"])
             if c == 0: configure_auth()
             elif c == 1: configure_webhook()
             elif c == 2: configure_debug()
@@ -1051,9 +890,10 @@ def main():
     show_banner()
     auth = get_auth_from_config()
     if auth is None:
-        safe_print(f"{Colors.YELLOW}Chưa có token, nhập ngay.{Colors.RESET}")
-        auth = prompt_auth()
-    main_menu(auth)
+        safe_print(f"{Colors.YELLOW}Chưa có tài khoản cấu hình, nhập ngay.{Colors.RESET}")
+        auth = prompt_login()
+    if auth:
+        main_menu(auth)
 
 if __name__ == "__main__":
     main()
